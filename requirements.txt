@@ -1,0 +1,14 @@
+# 桌面圆盘启动器 —— 运行依赖
+# Desktop Dial Launcher -- runtime dependencies
+#
+# 安装： pip install -r requirements.txt
+# 环境： Windows 10/11 64 位 + Python 3.8 及以上（开发与打包验证环境为 Python 3.11.8）
+#
+# 唯一必需依赖：PyQt5
+#   开发验证版本：PyQt5 5.15.11（附带 Qt 5.15.2 运行时）
+#   PyQt5 为 GPL v3 / 商业双授权，详见 NOTICE 文件
+PyQt5==5.15.11
+
+# ---- 可选：仅重新合成 sounds/ 音效时才需要 ----
+# 程序运行时不导入 numpy，打包 exe 时也不会包含它。
+# numpy==2.4.6

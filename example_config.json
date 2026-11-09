@@ -1,0 +1,300 @@
+{
+  "version": 2,
+  "sectors": 8,
+  "radius": 168,
+  "inner_radius": 52,
+  "icon_size": 32,
+  "font_size": 10,
+  "drag_threshold": 12,
+  "cancel_margin": 70,
+  "dead_zone_ratio": 0.5,
+  "swallow_move_events": false,
+  "theme": {
+    "follow_system": true,
+    "mode": "auto"
+  },
+  "colors": {
+    "base": "#1B1F2A",
+    "base_alpha": 205,
+    "empty_alpha": 60,
+    "accent": "#4FC3F7",
+    "accent_alpha": 225,
+    "text": "#EAF1F8",
+    "warn": "#FF8A65"
+  },
+  "sound": {
+    "enabled": true,
+    "theme": "glass",
+    "volume": 0.55,
+    "mute": false,
+    "backend": "auto",
+    "hover_pitch": true,
+    "hover_semitone": 1.0
+  },
+  "hotkey": {
+    "enabled": true,
+    "sequence": "Ctrl+Alt+Space"
+  },
+  "animation": {
+    "enabled": true,
+    "expand_ms": 170,
+    "collapse_ms": 130,
+    "hover_ms": 110,
+    "sector_gain": 1.1
+  },
+  "appearance": {
+    "frosted": true,
+    "glass_alpha": 0.8,
+    "gap_px": 3.2,
+    "sector_radius": 9.0,
+    "hub_name": true,
+    "glow": true,
+    "icon_shadow": true
+  },
+  "ring_gap": 6,
+  "switch_wheel": true,
+  "switch_keys": true,
+  "rings": [
+    {
+      "id": "ring1",
+      "name": "主环",
+      "accent": "",
+      "icon_size": 0,
+      "items": [
+        {
+          "label": "记事本",
+          "type": "app",
+          "target": "%WINDIR%\\System32\\notepad.exe",
+          "args": "",
+          "icon": "",
+          "hotkey": "",
+          "slot": 0
+        },
+        {
+          "label": "计算器",
+          "type": "app",
+          "target": "%WINDIR%\\System32\\calc.exe",
+          "args": "",
+          "icon": "",
+          "hotkey": "",
+          "slot": 1
+        },
+        {
+          "label": "画图",
+          "type": "app",
+          "target": "%WINDIR%\\System32\\mspaint.exe",
+          "args": "",
+          "icon": "",
+          "hotkey": "",
+          "slot": 2
+        },
+        {
+          "label": "下载",
+          "type": "folder",
+          "target": "%USERPROFILE%\\Downloads",
+          "args": "",
+          "icon": "",
+          "hotkey": "",
+          "slot": 3
+        },
+        {
+          "label": "文档",
+          "type": "folder",
+          "target": "%USERPROFILE%\\Documents",
+          "args": "",
+          "icon": "",
+          "hotkey": "",
+          "slot": 4
+        },
+        {
+          "label": "桌面",
+          "type": "folder",
+          "target": "%USERPROFILE%\\Desktop",
+          "args": "",
+          "icon": "",
+          "hotkey": "",
+          "slot": 5
+        },
+        {
+          "label": "资源管理器",
+          "type": "app",
+          "target": "%WINDIR%\\explorer.exe",
+          "args": "",
+          "icon": "",
+          "hotkey": "",
+          "slot": 6
+        },
+        {
+          "label": "回收站",
+          "type": "app",
+          "target": "%WINDIR%\\explorer.exe",
+          "args": "shell:RecycleBinFolder",
+          "icon": "",
+          "hotkey": "",
+          "slot": 7
+        }
+      ]
+    },
+    {
+      "id": "ring2",
+      "name": "工具盘",
+      "accent": "",
+      "icon_size": 0,
+      "items": [
+        {
+          "label": "命令行",
+          "type": "app",
+          "target": "%WINDIR%\\System32\\cmd.exe",
+          "args": "",
+          "icon": "",
+          "hotkey": "",
+          "slot": 0
+        },
+        {
+          "label": "任务管理器",
+          "type": "app",
+          "target": "%WINDIR%\\System32\\taskmgr.exe",
+          "args": "",
+          "icon": "",
+          "hotkey": "",
+          "slot": 1
+        },
+        {
+          "label": "控制面板",
+          "type": "app",
+          "target": "%WINDIR%\\System32\\control.exe",
+          "args": "",
+          "icon": "",
+          "hotkey": "",
+          "slot": 2
+        },
+        {
+          "label": "图片",
+          "type": "folder",
+          "target": "%USERPROFILE%\\Pictures",
+          "args": "",
+          "icon": "",
+          "hotkey": "",
+          "slot": 3
+        },
+        {
+          "label": "音乐",
+          "type": "folder",
+          "target": "%USERPROFILE%\\Music",
+          "args": "",
+          "icon": "",
+          "hotkey": "",
+          "slot": 4
+        },
+        {
+          "label": "视频",
+          "type": "folder",
+          "target": "%USERPROFILE%\\Videos",
+          "args": "",
+          "icon": "",
+          "hotkey": "",
+          "slot": 5
+        },
+        {
+          "label": "示例快捷方式 A",
+          "type": "app",
+          "target": "%USERPROFILE%\\Desktop\\示例\\示例程序 A.lnk",
+          "args": "",
+          "icon": "",
+          "hotkey": "",
+          "slot": 6
+        },
+        {
+          "label": "示例快捷方式 B",
+          "type": "app",
+          "target": "%USERPROFILE%\\Desktop\\示例\\示例程序 B.lnk",
+          "args": "",
+          "icon": "",
+          "hotkey": "",
+          "slot": 7
+        }
+      ]
+    }
+  ],
+  "current_ring": 0,
+  "ui": {
+    "geometry": "",
+    "maximized": false,
+    "nav_width": 168,
+    "splitter": []
+  },
+  "items": [
+    {
+      "label": "记事本",
+      "type": "app",
+      "target": "%WINDIR%\\System32\\notepad.exe",
+      "args": "",
+      "icon": "",
+      "hotkey": "",
+      "slot": 0
+    },
+    {
+      "label": "计算器",
+      "type": "app",
+      "target": "%WINDIR%\\System32\\calc.exe",
+      "args": "",
+      "icon": "",
+      "hotkey": "",
+      "slot": 1
+    },
+    {
+      "label": "画图",
+      "type": "app",
+      "target": "%WINDIR%\\System32\\mspaint.exe",
+      "args": "",
+      "icon": "",
+      "hotkey": "",
+      "slot": 2
+    },
+    {
+      "label": "下载",
+      "type": "folder",
+      "target": "%USERPROFILE%\\Downloads",
+      "args": "",
+      "icon": "",
+      "hotkey": "",
+      "slot": 3
+    },
+    {
+      "label": "文档",
+      "type": "folder",
+      "target": "%USERPROFILE%\\Documents",
+      "args": "",
+      "icon": "",
+      "hotkey": "",
+      "slot": 4
+    },
+    {
+      "label": "桌面",
+      "type": "folder",
+      "target": "%USERPROFILE%\\Desktop",
+      "args": "",
+      "icon": "",
+      "hotkey": "",
+      "slot": 5
+    },
+    {
+      "label": "资源管理器",
+      "type": "app",
+      "target": "%WINDIR%\\explorer.exe",
+      "args": "",
+      "icon": "",
+      "hotkey": "",
+      "slot": 6
+    },
+    {
+      "label": "回收站",
+      "type": "app",
+      "target": "%WINDIR%\\explorer.exe",
+      "args": "shell:RecycleBinFolder",
+      "icon": "",
+      "hotkey": "",
+      "slot": 7
+    }
+  ]
+}

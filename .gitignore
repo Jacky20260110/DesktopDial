@@ -1,0 +1,58 @@
+# ---------------------------------------------------------------------------
+# 桌面圆盘启动器 / Desktop Dial Launcher —— Git 忽略清单
+# 目的：保证"用户配置、运行日志、打包产物、验证截图"绝不进入仓库
+# ---------------------------------------------------------------------------
+
+# ---- Python 缓存与虚拟环境 ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.Python
+
+# ---- 用户本地配置（含个人路径，绝不上传）----
+desktop_dial_config.json
+desktop_dial_config.json.bak
+*_config.json.bak
+config.local.json
+
+# ---- 运行日志 ----
+*.log
+*.log.*
+
+# ---- 打包与构建产物 ----
+build/
+dist/
+release/
+*.spec
+*.manifest
+*.pyz
+*.pkg
+成果物/
+
+# ---- 历史备份与临时脚本 ----
+*.orig_bak
+*.bak
+*.tmp
+temp/
+tmp/
+scratch/
+
+# ---- 开发期验证产物（截图/音效缓存）----
+settings_shots/
+shots/
+sound_cache/
+verify*.png
+校验报告*.md
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store

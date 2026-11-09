@@ -1,0 +1,81 @@
+桌面圆盘启动器 / Desktop Dial Launcher
+Copyright (C) 2026 Jacky
+
+本文件列出本项目所使用的第三方组件及其许可协议。
+This file lists third-party components used by this project and their licenses.
+
+================================================================
+一、运行期依赖 / Runtime dependency
+================================================================
+
+1) PyQt5 5.15.11
+   - 许可：GNU General Public License v3（开源使用）/ 商业授权双轨（Riverbank Computing）
+   - License: GNU GPL v3 for open-source use, or a commercial license from Riverbank Computing
+   - 用途：窗口、绘制、系统托盘、图形配置窗、QtMultimedia 播放音效
+   - 项目主页：https://www.riverbankcomputing.com/software/pyqt/
+   - 授权说明：https://www.riverbankcomputing.com/commercial/pyqt
+   - PyQt5 的 GPL v3 授权是本项目必须以 GPL v3 发布的直接原因。
+
+2) Qt 5.15.2（PyQt5 附带的 Qt 运行库，PyQt5-Qt5 5.15.2）
+   - 许可：GNU LGPL v3 / GNU GPL v3（依具体模块而定）
+   - License: GNU LGPL v3 / GNU GPL v3, depending on the module
+   - 用途：PyQt5 底层 C++ 框架
+   - 项目主页：https://www.qt.io/
+   - 开源授权义务：https://www.qt.io/licensing/open-source-lgpl-obligations
+
+3) Python 3.11.8
+   - 许可：Python Software Foundation License (PSF-2.0)
+   - 用途：程序运行环境；打包时以独立解释器形式随 exe 分发
+   - 项目主页：https://www.python.org/
+   - 许可证全文：https://docs.python.org/3/license.html
+
+================================================================
+二、仅构建期使用，不上传包进源码运行链 / Build-time only
+================================================================
+
+4) numpy（本机验证版本 2.4.6）
+   - 许可：BSD 3-Clause
+   - 用途：仅在开发期用脚本合成 sounds/ 目录下的 WAV 音效；程序运行时不导入 numpy，
+     PyInstaller 打包时未包含 numpy，用户运行 exe 无需安装 numpy。
+   - 项目主页：https://numpy.org/
+   - 许可证全文：https://numpy.org/doc/stable/license.html
+
+5) PyInstaller（本机验证版本 6.22.3）
+   - 许可：GPL 2.0-or-later，附 bootloader 例外条款（允许打包闭源/GPL 程序并分发 exe）
+   - 用途：将 Python 脚本打包为免环境依赖的 Windows 可执行文件；源码运行不需要它
+   - 项目主页：https://pyinstaller.org/
+   - 许可证全文：https://github.com/pyinstaller/pyinstaller/blob/develop/COPYING.txt
+
+================================================================
+三、本项目原创素材 / Original assets of this project
+================================================================
+
+6) 音效素材 sounds/
+   - 所有权：本项目原创
+   - 来源：全部 61 个 WAV 音效（glass 玻璃 20 + mechanical 机械 20 + minimal 极简 20 +
+     cancel/hide/show 等状态音）均由本项目自带的合成脚本用正弦/噪声包络算法程序化生成，
+     不含任何第三方采样库、音效包或商业音源。
+   - 授权：随本项目一并以 GPL v3 发布，可自由再分发。
+
+7) 程序图标 desktop_dial.ico
+   - 所有权：本项目原创
+   - 来源：本项目自绘（矢量几何绘制后导出多尺寸 ICO），不含第三方图标库素材。
+   - 授权：随本项目一并以 GPL v3 发布。
+
+8) 应用图标显示
+   - 圆盘扇区里显示的是用户本机已安装程序的真实图标，通过 Windows Shell API
+     （SHGetFileInfo 等）在运行时读取，不随本仓库分发任何第三方程序的图标资源。
+
+================================================================
+四、许可证全文 / Full license text
+================================================================
+
+本项目整体以 GNU General Public License version 3 发布，
+许可证全文见仓库根目录 LICENSE 文件，或访问：
+https://www.gnu.org/licenses/gpl-3.0.html
+
+This project is licensed under the GNU General Public License v3.
+See the LICENSE file in the repository root for the full text.
+
+若需以非 GPL 方式（闭源/商业）使用，需另行获得 PyQt5 的商业授权。
+For non-GPL (proprietary/commercial) use, a commercial PyQt5 license is required.
