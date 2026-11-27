@@ -40,7 +40,7 @@
   移动选中、单击确认、数字键 1..N 直接启动、Esc / 点空白取消。
 
 依赖：Python 3.8+ / PyQt5（Windows 平台），全局钩子通过 ctypes 调用 user32，
-音效由 numpy 合成后经 QtMultimedia(QSoundEffect) 播放（缺失时回退 winsound）。
+音效由 numpy 合成后经常驻 waveOut 声道播放（低延迟），不可用时回退 winsound。
 
 作者说明：本文件为最终交付版本，配套文件：
     desktop_dial.pyw   免控制台启动
@@ -69,12 +69,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt5.QtCore import (
     QPoint, QPointF, QRect, QRectF, QSize, QTimer, Qt, QObject, pyqtSignal, pyqtSlot,
-    QFileInfo, QPropertyAnimation, QEasingCurve, pyqtProperty, QUrl, QByteArray,
+    QFileInfo, QPropertyAnimation, QVariantAnimation, QEasingCurve, pyqtProperty, QUrl,
+    QByteArray,
 )
 from PyQt5.QtGui import (
     QBrush, QColor, QFont, QFontMetrics, QGuiApplication, QIcon, QImage, QLinearGradient,
     QPainter, QPainterPath, QPen, QPixmap, QCursor, QRadialGradient, QDragEnterEvent,
-    QDropEvent, QKeySequence,
+    QDropEvent, QKeySequence, QDesktopServices,
 )
 from PyQt5.QtWidgets import (
     QAbstractItemView, QAbstractSpinBox, QAction, QApplication, QCheckBox, QComboBox, QDialog,
@@ -99,6 +100,171 @@ except Exception:  # pragma: no cover - 非 Windows
     _HAS_WINSOUND = False
 
 try:
+    _WINMM = ctypes.WinDLL("winmm", use_last_error=True)  # 低延迟常驻声道
+    _HAS_WINMM = True
+except Exception:  # pragma: no cover - 非 Windows
+    _WINMM = None  # type: ignore
+    _HAS_WINMM = False
+
+WHDR_DONE = 0x00000001
+WHDR_PREPARED = 0x00000002
+WAVE_FORMAT_PCM = 1
+WAVE_MAPPER = -1
+
+
+class _WAVEFORMATEX(ctypes.Structure):
+    _fields_ = [("wFormatTag", ctypes.c_ushort),
+                ("nChannels", ctypes.c_ushort),
+                ("nSamplesPerSec", ctypes.c_uint32),
+                ("nAvgBytesPerSec", ctypes.c_uint32),
+                ("nBlockAlign", ctypes.c_ushort),
+                ("wBitsPerSample", ctypes.c_ushort),
+                ("cbSize", ctypes.c_ushort)]
+
+
+class _WAVEHDR(ctypes.Structure):
+    pass
+
+
+_WAVEHDR._fields_ = [("lpData", ctypes.c_void_p),
+                     ("dwBufferLength", ctypes.c_uint32),
+                     ("dwBytesRecorded", ctypes.c_uint32),
+                     ("dwUser", ctypes.c_void_p),
+                     ("dwFlags", ctypes.c_uint32),
+                     ("dwLoops", ctypes.c_uint32),
+                     ("lpNext", ctypes.POINTER(_WAVEHDR)),
+                     ("reserved", ctypes.c_void_p)]
+
+
+class WaveOutChannel:
+    """常驻 waveOut 声道：设备只打开一次，播放退化为一次内存拷贝 + waveOutWrite。
+
+    winsound.PlaySound(SND_ASYNC) 每次调用都要让 winmm 重新起一条播放流，
+    调用方返回虽快（0.1ms 级），但**从调用到喇叭真实出声**通常滞后 30~100ms，
+    每次 hover 都调一次就像「慢半拍」。这里把设备流固定下来，只往里塞 PCM，
+    出声延迟可以压到 10ms 量级；同时因为不抢占，快速扫扇区时音效会排队，
+    所以由调用方限制队列深度，超了直接丢，避免出现「越扫越拖尾」。
+    """
+
+    CHANNELS = 4
+    BUF_CAP = 131072                      # 单声道 16bit 44.1k 下约 1.48s 余量
+
+    def __init__(self, framerate: int, nchannels: int, sampwidth: int) -> None:
+        self.ok = False
+        self.rate = int(framerate)
+        self.nch = int(nchannels)
+        self.sw = int(sampwidth)
+        self._h = ctypes.c_void_p()
+        self._hdrs: List[_WAVEHDR] = []
+        self._bufs: List[Any] = []
+        self._in_use: List[bool] = []
+        self._tags: List[Any] = []
+        if not _HAS_WINMM or self.sw != 2:
+            return
+        fmt = _WAVEFORMATEX()
+        fmt.wFormatTag = WAVE_FORMAT_PCM
+        fmt.nChannels = self.nch
+        fmt.nSamplesPerSec = self.rate
+        fmt.nBlockAlign = self.nch * self.sw
+        fmt.nAvgBytesPerSec = self.rate * fmt.nBlockAlign
+        fmt.wBitsPerSample = self.sw * 8
+        fmt.cbSize = 0
+        try:
+            rc = _WINMM.waveOutOpen(ctypes.byref(self._h), WAVE_MAPPER,
+                                    ctypes.byref(fmt), None, None, 0)
+        except Exception:
+            return
+        if rc != 0:
+            log.warning("waveOutOpen 失败 rc=%s，回退其他后端", rc)
+            return
+        for _ in range(self.CHANNELS):
+            buf = ctypes.create_string_buffer(self.BUF_CAP)
+            hdr = _WAVEHDR()
+            hdr.lpData = ctypes.cast(buf, ctypes.c_void_p)
+            hdr.dwBufferLength = self.BUF_CAP
+            hdr.dwFlags = 0
+            _WINMM.waveOutPrepareHeader(self._h, ctypes.byref(hdr), ctypes.sizeof(hdr))
+            self._bufs.append(buf)
+            self._hdrs.append(hdr)
+            self._in_use.append(False)
+            self._tags.append(None)
+        self.last_write_t = 0.0
+        self.ok = True
+
+    # -------------------------------------------------------- 播放
+    def playing(self) -> int:
+        """当前在播/排队的缓冲数。"""
+        if not self.ok:
+            return 0
+        n = 0
+        for i, hdr in enumerate(self._hdrs):
+            if self._in_use[i] and not (hdr.dwFlags & WHDR_DONE):
+                n += 1
+            elif hdr.dwFlags & WHDR_DONE:
+                self._in_use[i] = False
+                self._tags[i] = None
+        return n
+
+    def hover_only(self) -> bool:
+        """队列里是否只剩 hover 类音效（这类被打断无所谓）。"""
+        for i, hdr in enumerate(self._hdrs):
+            if self._in_use[i] and not (hdr.dwFlags & WHDR_DONE):
+                if self._tags[i] not in ("hover",):
+                    return False
+        return True
+
+    def restart(self, pcm: bytes, tag: str = "hover") -> bool:
+        """清空队列后立刻播新音（覆盖式短音效，最跟手）。"""
+        if not self.ok:
+            return False
+        try:
+            _WINMM.waveOutReset(self._h)
+        except Exception:
+            return False
+        for i in range(len(self._hdrs)):
+            self._in_use[i] = False
+            self._tags[i] = None
+        return self.play(pcm, tag)
+
+    def play(self, pcm: bytes, tag: str = "") -> bool:
+        if not self.ok or not pcm:
+            return False
+        n = len(pcm)
+        if n > self.BUF_CAP:
+            return False
+        for i, hdr in enumerate(self._hdrs):
+            if self._in_use[i] and not (hdr.dwFlags & WHDR_DONE):
+                continue
+            if hdr.dwBufferLength != n:
+                # 准备过的头不允许改长度，先 unprepare 再重设
+                _WINMM.waveOutUnprepareHeader(self._h, ctypes.byref(hdr),
+                                              ctypes.sizeof(hdr))
+                hdr.dwBufferLength = n
+                hdr.dwFlags = 0
+                _WINMM.waveOutPrepareHeader(self._h, ctypes.byref(hdr),
+                                            ctypes.sizeof(hdr))
+            ctypes.memmove(hdr.lpData, pcm, n)
+            self._in_use[i] = True
+            self._tags[i] = tag
+            _WINMM.waveOutWrite(self._h, ctypes.byref(hdr), ctypes.sizeof(hdr))
+            self.last_write_t = time.perf_counter()
+            return True
+        return False
+
+    def close(self) -> None:
+        if not self.ok or not _HAS_WINMM:
+            return
+        try:
+            _WINMM.waveOutReset(self._h)
+            for hdr in self._hdrs:
+                _WINMM.waveOutUnprepareHeader(self._h, ctypes.byref(hdr),
+                                              ctypes.sizeof(hdr))
+            _WINMM.waveOutClose(self._h)
+        except Exception:
+            pass
+        self.ok = False
+
+try:
     import winreg  # 读取系统深浅色主题
     _HAS_WINREG = True
 except Exception:  # pragma: no cover - 非 Windows
@@ -107,6 +273,8 @@ except Exception:  # pragma: no cover - 非 Windows
 
 APP_NAME = "DesktopDial"
 APP_TITLE = "桌面圆盘启动器"
+APP_VERSION = "1.1.0"                       # 版本号（设置 → 关于）
+PROJECT_URL = "https://github.com/Jacky20260110/DesktopDial"   # GitHub 链接
 
 
 # ---------------------------------------------------------------- 运行期路径
@@ -502,9 +670,9 @@ DEFAULT_RING2_ITEMS: List[Dict[str, Any]] = [
 DEFAULT_CONFIG: Dict[str, Any] = {
     "version": CONFIG_VERSION,  # 配置结构版本（1=旧的扁平 items；2=多环 rings）
     "sectors": 8,             # 扇区数量（4 / 6 / 8 / 12 视觉效果最佳）
-    "radius": 168,            # 外半径（逻辑像素）
+    "radius": 200,            # 外半径（逻辑像素）
     "inner_radius": 52,       # 内半径（中心圆盘，死区）
-    "icon_size": 32,          # 图标边长
+    "icon_size": 18,          # 图标边长
     "font_size": 10,          # 标签字号
     "drag_threshold": 12,     # 唤起阈值：按下后拖动超过多少像素才弹出
     "cancel_margin": 70,      # 取消余量：超出 radius + cancel_margin 视为取消
@@ -520,12 +688,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "mode": "auto",        # auto | dark | light
     },
     "colors": {
-        "base": "#1B1F2A",
+        "base": "#14232D",
         "base_alpha": 205,
         "empty_alpha": 60,
-        "accent": "#4FC3F7",
-        "accent_alpha": 225,
-        "text": "#EAF1F8",
+        "accent": "#3DC7F5",
+        "accent_alpha": 205,
+        "text": "#EAF6FF",
         "warn": "#FF8A65",
     },
     # 音效套件（wav 由程序合成，见 sounds/ 目录）
@@ -534,7 +702,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "theme": "glass",        # glass | mechanical | minimal
         "volume": 0.55,          # 0.0 ~ 1.0
         "mute": False,
-        "backend": "auto",       # auto | async | qsound（async=winsound 非阻塞，默认）
+        "backend": "auto",       # auto | waveout | async | qsound（auto→waveout 常驻声道，最低延迟）
         "hover_pitch": True,     # 悬停音高随扇区序号递变
         "hover_semitone": 1.0,   # 每个扇区升多少半音
     },
@@ -555,11 +723,40 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "appearance": {
         "frosted": True,        # 磨砂玻璃质感（半透明 + 内高光 + 柔和边缘）
         "glass_alpha": 0.80,    # 玻璃底色不透明度（0~1，按 base 色推导）
-        "gap_px": 3.2,          # 扇区之间的间隙（像素，形成圆角缝隙）
+        "gap_px": 1.5,          # 扇区之间的间隙（像素，形成圆角缝隙）
         "sector_radius": 9.0,   # 扇区圆角（像素）
         "hub_name": True,       # 中心显示当前环名
         "glow": True,           # 选中扇区外发光
         "icon_shadow": True,    # 图标底部投影（提升质感）
+        # 配色方案：classic=原磨砂玻璃；aurora=极光玻璃（挤出厚度侧壁 +
+        # 外缘镜面高光 + 内壁暗槽 + 图标玻璃底板）。热更新，切换只重绘不重启。
+        "color_scheme": "classic",
+        "aurora_side_px": 4.4,   # 极光玻璃挤出厚度（像素，1.2~10.0）
+        "aurora_specular": 1.15,  # 外缘镜面高光强度（0.6~1.4，实测 1.15 环带 p90=197）
+        "aurora_groove": 1.15,   # 内壁暗槽压暗系数（0.4~1.6，越大槽越深）
+        # 极光模式下扇区的圆角半径（像素）。极光扇区是纯填充、没有 classic
+        # 那层 2*cr 的圆头描边把内缩补回来，所以 cr 会全额变成扇区之间的缝：
+        # 视觉缝宽 ≈ gap_px + 2*aurora_corner_px。要贴合紧密就调这里。
+        "aurora_corner_px": 3.0,
+        # ---- 科技霓虹方案（neon）：参数口径完全对齐《科技感环形启动轮盘》
+        # 原型 hsla(HUE, s, l, a)，此处把原型的每一个字面量都映射成一个可调项，
+        # 默认值即原型数值，改 neon_hue 可整环换色（195 青蓝 / 265 紫 / 20 金红）。
+        "neon_hue": 195,          # 色相（原型 HUE=195）
+        "neon_corner_px": 3.0,    # 扇区圆角（连续环上直接等于缝宽，保持紧贴）
+        "neon_band": 0.60,        # 环带宽 / 圆盘半径（原型 150/250 = 0.60）
+        "neon_core": 0.75,        # 中心盘半径 / 内孔半径（原型 75/100 = 0.75）
+        "neon_fill_alpha": 0.12,  # 槽位底色不透明度（原型 hsla(HUE,30,60,0.12)）
+        "neon_fill_hover": 0.10,  # 悬停在此之上叠加（原型 +0.10*hover）
+        "neon_line_px": 1.2,      # 描边宽度（原型 pen.setWidthF(1.2)）
+        "neon_line_alpha": 0.35,  # 描边不透明度（原型 hsla(HUE,80,75,0.35)）
+        "neon_line_hover": 0.30,  # 悬停叠加（原型 +0.3*hover）
+        "neon_top_alpha": 30.0,   # 顶部高光峰值 alpha（原型 int(30+30*hover)）
+        "neon_glow_alpha": 0.35,  # 选中外发光峰值（原型 drop shadow 0.35 / blur 16）
+        "neon_ring_alpha": 1.00,  # 外圈霓虹峰值亮度倍率（原型 alpha=255*glow）
+        "neon_breath_ms": 3200,   # 呼吸周期毫秒（原型 3200ms）
+        "neon_breath_min": 0.85,  # 呼吸最暗亮度（原型 0.85 ↔ 1.0）
+        "neon_backdrop": 0.80,    # 深空径向背衬强度（0=关闭，完全透出桌面）
+        "neon_hub_shadow": 1.00,  # 中心盘外发光强度倍率（原型 blur 25 / 0.45）
     },
     # 多环
     "ring_gap": 6,              # 多环同时显示时的径向间隙（预留，当前版本单环展示）
@@ -784,13 +981,43 @@ def save_config(path: str, cfg: Dict[str, Any]) -> Tuple[bool, str]:
 
 # ---------------------------------------------------------------- 深浅色调色板
 PALETTE_DARK: Dict[str, Any] = {
-    "base": "#1B1F2A", "base_alpha": 205, "empty_alpha": 60,
-    "accent": "#4FC3F7", "accent_alpha": 225, "text": "#EAF1F8", "warn": "#FF8A65",
+    "base": "#14232D", "base_alpha": 205, "empty_alpha": 60,
+    "accent": "#3DC7F5", "accent_alpha": 205, "text": "#EAF6FF", "warn": "#FF8A65",
 }
 PALETTE_LIGHT: Dict[str, Any] = {
     "base": "#F7F9FC", "base_alpha": 236, "empty_alpha": 74,
     "accent": "#0B84C4", "accent_alpha": 214, "text": "#1B2430", "warn": "#D9542B",
 }
+
+# ---------------------------------------------------------------- 极光玻璃光照
+# 方向光固定在左上：dot = ux*LX + uy*LY 就是扇区朝向与光线的点积，
+# 左上最亮、右下最暗。八个扇区齐刷刷一样亮是"假玻璃"最明显的信号，
+# 所以再叠一个确定性扰动，让峰值参差不齐且每次渲染可复现。
+_AURORA_LX, _AURORA_LY = -0.7071, -0.7071
+
+
+def _hsla(h: float, s: float, l: float, a: float = 1.0) -> QColor:
+    """HSL 取色（s/l 用 0~100 的整数风格，a 用 0~1），与原型 hsla() 完全同源。
+
+    科技霓虹方案的所有颜色都从这里派生：只要改 hue，整套配色一起偏移
+    （195 青蓝 / 265 紫 / 20 金红），不用逐个手填 RGB。
+    """
+    return QColor.fromHslF((float(h) % 360.0) / 360.0,
+                           max(0.0, min(1.0, float(s) / 100.0)),
+                           max(0.0, min(1.0, float(l) / 100.0)),
+                           max(0.0, min(1.0, float(a))))
+
+
+def aurora_sector_light(i: int, n: int) -> float:
+    """第 i 个扇区的极光受光系数（约 0.55~1.05）。"""
+    span = 360.0 / max(1, int(n))
+    a = math.radians(i * span + span / 2.0)
+    ux, uy = math.sin(a), -math.cos(a)
+    dot = ux * _AURORA_LX + uy * _AURORA_LY
+    base = 0.46 + 0.80 * (dot + 1.0) * 0.5
+    jit = 0.84 + 0.30 * (0.5 + 0.5 * math.sin(i * 2.399 + 1.1))
+    return base * jit
+
 
 APPS_USE_LIGHT_KEY = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
 
@@ -1009,10 +1236,15 @@ class SoundKit(QObject):
     wav 全部由 temp/gen_sounds.py 用 numpy 合成（非下载素材）。
 
     播放后端（sound.backend，默认 "auto"）：
-      * "async"（Windows 默认）：winsound.PlaySound(SND_FILENAME|SND_ASYNC)。
-        winmm 自己起线程读盘解码，调用方只做一次 P/Invoke——实测中位 0.12ms、
-        P95 0.17ms，绝不阻塞 UI 线程。音量通过「启动时预生成按音量缩放好的
-        wav 缓存文件」实现（等价于音量设置，保留 sound.volume 语义）。
+      * "waveout"（Windows 默认，最低延迟）：常驻 waveOut 声道。设备与流只在启动时
+        打开一次，所有 wav 启动即读成内存 PCM，播放退化为「一次 memmove +
+        waveOutWrite」。用 waveOutGetPosition 实测：调用耗时 0.3ms，
+        **从调用到喇叭真实出声约 48ms**；快速扫扇区时对 hover 采用覆盖式打断，
+        队列不会被塞满，不会越扫越拖尾。
+      * "async"：winsound.PlaySound(SND_FILENAME|SND_ASYNC)。调用方只做一次
+        P/Invoke（0.1~2ms，不阻塞 UI），但它每次都要让 winmm 重新起一条播放流，
+        实测**从调用到真实出声约 237ms**，体感就是「慢半拍」，已降级为备选。
+        音量通过「启动时预生成按音量缩放好的 wav 缓存文件」实现。
       * "qsound"：QSoundEffect。可运行时直接改音量，但首次 setSource 要解码，
         实测单文件同步阻塞 220ms+（切 source 更慢），会直接卡住 UI 线程，
         因此只作为可选后端保留，不再是默认值。
@@ -1023,6 +1255,10 @@ class SoundKit(QObject):
         self.base_dir = base_dir
         self._effects: Dict[str, Any] = {}          # qsound 后端专用
         self._scaled: Dict[str, str] = {}           # 源 wav -> 已缩放缓存 wav
+        self._pcm: Dict[str, bytes] = {}            # 源 wav -> 已缩放 PCM（waveout 用）
+        self._waveout: Optional[WaveOutChannel] = None
+        self._waveout_fmt: Tuple[int, int, int] = (0, 0, 0)
+        self._last_hover_t = 0.0
         self._cache_sig: Tuple[Any, ...] = ()
         self._cache_dir = sound_cache_dir()
         self.warm_ms = 0.0
@@ -1052,6 +1288,18 @@ class SoundKit(QObject):
             self.hover_semitone = float(pack.get("hover_semitone", 1.0))
         except (TypeError, ValueError):
             self.hover_semitone = 1.0
+        try:  # 扫扇区时两次 hover 的最小间隔，避免音效排队堆积成「拖尾」
+            self.hover_min_gap_ms = max(0.0, float(pack.get("hover_min_gap_ms", 12.0)))
+        except (TypeError, ValueError):
+            self.hover_min_gap_ms = 12.0
+        try:  # 允许覆盖上一声 hover 的最小已播时长（太小会截断产生爆音）
+            self.hover_cut_min_ms = max(0.0, float(pack.get("hover_cut_min_ms", 45.0)))
+        except (TypeError, ValueError):
+            self.hover_cut_min_ms = 45.0
+        try:  # 常驻声道里允许同时在播/排队的缓冲数，超出的 hover 直接丢弃
+            self.max_queue = max(1, int(pack.get("max_queue", 2)))
+        except (TypeError, ValueError):
+            self.max_queue = 2
         self._apply_volume()
         if getattr(self, "_inited", False):
             self._select_backend()
@@ -1059,16 +1307,61 @@ class SoundKit(QObject):
 
     # -------------------------------------------------- 后端与音量缓存
     def _select_backend(self) -> None:
-        want = self.backend_pref if self.backend_pref in ("auto", "async", "qsound") else "auto"
+        want = self.backend_pref if self.backend_pref in (
+            "auto", "waveout", "async", "qsound") else "auto"
         if want == "auto":
+            want = "waveout" if _HAS_WINMM else (
+                "async" if _HAS_WINSOUND else ("qsound" if _HAS_QSOUND else "none"))
+        if want == "waveout" and not _HAS_WINMM:
             want = "async" if _HAS_WINSOUND else ("qsound" if _HAS_QSOUND else "none")
         if want == "async" and not _HAS_WINSOUND:
-            want = "qsound" if _HAS_QSOUND else "none"
+            want = "waveout" if _HAS_WINMM else ("qsound" if _HAS_QSOUND else "none")
         if want == "qsound" and not _HAS_QSOUND:
-            want = "async" if _HAS_WINSOUND else "none"
+            want = "waveout" if _HAS_WINMM else ("async" if _HAS_WINSOUND else "none")
         if want != self.backend:
             log.info("SOUND backend -> %s（配置=%s）", want, self.backend_pref)
         self.backend = want
+
+    def _ensure_waveout(self, fmt: Tuple[int, int, int]) -> Optional["WaveOutChannel"]:
+        """按音频格式（采样率/声道/位宽）打开或复用常驻声道。"""
+        if self._waveout is not None and self._waveout.ok and self._waveout_fmt == fmt:
+            return self._waveout
+        if self._waveout is not None:
+            self._waveout.close()
+            self._waveout = None
+        ch = WaveOutChannel(*fmt)
+        if not ch.ok:
+            log.warning("SOUND 常驻声道不可用，降级 async")
+            return None
+        self._waveout = ch
+        self._waveout_fmt = fmt
+        log.info("SOUND waveout 常驻声道就绪 rate=%d ch=%d bits=%d buffers=%d",
+                 fmt[0], fmt[1], fmt[2] * 8, WaveOutChannel.CHANNELS)
+        return ch
+
+    def _load_pcm(self) -> None:
+        """把已缩放的 wav 全部读成内存 PCM：播放热路径零磁盘 IO、零解码。"""
+        import wave
+        pcm: Dict[str, bytes] = {}
+        fmt: Optional[Tuple[int, int, int]] = None
+        for src, real in self._scaled.items():
+            try:
+                with wave.open(real, "rb") as w:
+                    f = (w.getframerate(), w.getnchannels(), w.getsampwidth())
+                    if f[2] != 2:
+                        continue          # 只处理 16bit，其余交给其他后端
+                    if fmt is None:
+                        fmt = f
+                    if f != fmt:
+                        continue          # 格式不统一的不进常驻声道
+                    pcm[src] = w.readframes(w.getnframes())
+            except Exception:
+                log.debug("SOUND PCM 预读失败 %s", real, exc_info=True)
+        self._pcm = pcm
+        if fmt is not None and self.backend == "waveout":
+            if self._ensure_waveout(fmt) is None:
+                self.backend = "async" if _HAS_WINSOUND else "none"
+                self._pcm = {}
 
     def _scale_pcm(self, frames: bytes, volume: float) -> bytes:
         """按音量缩放 16bit PCM（音效素材均为 16bit 合成音）。"""
@@ -1097,13 +1390,15 @@ class SoundKit(QObject):
         目的是把「音量」从播放热路径移出去：播放退化为一次 P/Invoke，
         不再有读盘 + 采样缩放的成本。
         """
-        if self.backend != "async":
+        if self.backend not in ("async", "waveout"):
             self._scaled = {}
+            self._pcm = {}
             self.warm_ms = 0.0
             return
         vol = self.effective_volume()
         sig = (self.theme, round(vol, 3))
-        if sig == self._cache_sig and self._scaled:
+        if sig == self._cache_sig and self._scaled and (
+                self.backend != "waveout" or self._pcm):
             return
         t0 = time.perf_counter()
         mapping: Dict[str, str] = {}
@@ -1148,6 +1443,9 @@ class SoundKit(QObject):
         self.warm_ms = (time.perf_counter() - t0) * 1000.0
         log.info("SOUND warm theme=%s vol=%.2f files=%d 耗时=%.1fms cache=%s",
                  self.theme, vol, len(mapping), self.warm_ms, folder)
+        if self.backend == "waveout":
+            self._load_pcm()
+            log.info("SOUND PCM 预载 files=%d backend=%s", len(self._pcm), self.backend)
 
     def _apply_volume(self) -> None:
         for eff in self._effects.values():
@@ -1210,7 +1508,34 @@ class SoundKit(QObject):
         t0 = time.perf_counter()
         played = False
         st = "-"
-        if self.backend == "async":
+        if self.backend == "waveout":
+            pcm = self._pcm.get(path)
+            ch = self._waveout
+            if ch is not None and ch.ok and pcm:
+                now = time.perf_counter()
+                if event == "hover":
+                    gap = (now - self._last_hover_t) * 1000.0
+                    if self.hover_min_gap_ms > 0.0 and gap < self.hover_min_gap_ms:
+                        log.debug("SOUND hover 节流 gap=%.1fms < %.1fms", gap,
+                                  self.hover_min_gap_ms)
+                        return False
+                    self._last_hover_t = now
+                    if ch.playing() >= self.max_queue:
+                        since = (now - ch.last_write_t) * 1000.0
+                        if ch.hover_only() and since >= self.hover_cut_min_ms:
+                            st = "waveout:cut"      # 覆盖上一声 hover，保持跟手
+                        else:
+                            log.debug("SOUND hover 丢弃（在播/排队已达 %d）", self.max_queue)
+                            return False
+                if st == "waveout:cut":
+                    played = ch.restart(pcm, event)
+                else:
+                    played = ch.play(pcm, event)
+                if played and st != "waveout:cut":
+                    st = "waveout"
+            else:
+                log.debug("SOUND waveout 缺 PCM，回退文件路径 path=%s", path)
+        elif self.backend == "async":
             try:
                 winsound.PlaySound(self._target_path(path),
                                    winsound.SND_FILENAME | winsound.SND_ASYNC |
@@ -1254,7 +1579,20 @@ class SoundKit(QObject):
             "themes": self.themes(), "warm_ms": round(self.warm_ms, 1),
             "show_wav": os.path.basename(p), "show_exists": os.path.isfile(p),
             "base_dir": self.base_dir, "play_count": self.play_count,
+            "pcm_ready": len(self._pcm),
+            "waveout": bool(self._waveout is not None and self._waveout.ok),
+            "fmt": "%d/%dch/%dbit" % (self._waveout_fmt[0], self._waveout_fmt[1],
+                                      self._waveout_fmt[2] * 8),
         }
+
+    def close(self) -> None:
+        """释放常驻声道（退出程序时调用，避免设备句柄泄漏）。"""
+        if self._waveout is not None:
+            try:
+                self._waveout.close()
+            except Exception:
+                pass
+            self._waveout = None
 
 
 # ================================================================ 快捷方式解析
@@ -2182,6 +2520,11 @@ class DialWindow(QWidget):
         self._watchdog.setInterval(15000)
         self._watchdog.timeout.connect(self.force_hide)
 
+        # 科技霓虹呼吸（原型 3200ms / 0.85~1.0）：只在面板可见时运行，收起即停，
+        # 空闲隐身场景下不产生任何定时器唤醒。
+        self._neon_glow = 1.0
+        self._neon_breath: Optional[QVariantAnimation] = None
+
         self.set_config(config)
 
     # -------------------------------------------------- 动画属性
@@ -2393,11 +2736,61 @@ class DialWindow(QWidget):
         if self.sound is not None:
             self.sound.play("show")
         self._watchdog.start()
+        self._start_neon_breath()
         self.update()
         log.info("DIAL open anchor=(%d,%d) center=(%.0f,%.0f) screen=%s dpr=%.2f hotkey=%s",
                  anchor.x(), anchor.y(), self._center_global.x(), self._center_global.y(),
                  getattr(self, "_screen_name", "?"), getattr(self, "_screen_dpr", 1.0),
                  self.hotkey_mode)
+
+    def _start_neon_breath(self) -> None:
+        """启动霓虹呼吸：亮度 1.0 -> neon_breath_min -> 1.0 无缝循环。
+
+        原型用 3200ms 的 0.85~1.0 呼吸，这里用 QVariantAnimation 的关键帧
+        做到端点连续（InOutSine 两端速度为 0，循环处不会跳变），
+        并且只有 color_scheme == neon 时才启动，其他方案零开销。
+        """
+        appear = self.cfg.get("appearance") or {}
+        if str(appear.get("color_scheme", "")).strip().lower() != "neon":
+            return
+        if not self.animations_enabled():
+            self._neon_glow = 1.0
+            return
+        try:
+            ms = int(appear.get("neon_breath_ms", 3200))
+        except (TypeError, ValueError):
+            ms = 3200
+        ms = max(600, min(20000, ms))
+        try:
+            lo = float(appear.get("neon_breath_min", 0.85))
+        except (TypeError, ValueError):
+            lo = 0.85
+        lo = max(0.30, min(1.0, lo))
+        if self._neon_breath is None:
+            anim = QVariantAnimation(self)
+            anim.setLoopCount(-1)
+            anim.valueChanged.connect(self._on_neon_breath)
+            self._neon_breath = anim
+        anim = self._neon_breath
+        anim.stop()
+        anim.setDuration(ms)
+        anim.setEasingCurve(QEasingCurve.InOutSine)
+        anim.setKeyValueAt(0.0, 1.0)
+        anim.setKeyValueAt(0.5, lo)
+        anim.setKeyValueAt(1.0, 1.0)
+        anim.start()
+
+    def _on_neon_breath(self, value: Any) -> None:
+        try:
+            self._neon_glow = float(value)
+        except (TypeError, ValueError):
+            return
+        self.update()
+
+    def _stop_neon_breath(self) -> None:
+        if self._neon_breath is not None:
+            self._neon_breath.stop()
+        self._neon_glow = 1.0
 
     def _start_expand_anim(self) -> None:
         """展开缓动：0 -> 1（OutCubic），由 QPropertyAnimation 驱动，无定时器抖动。"""
@@ -2443,6 +2836,7 @@ class DialWindow(QWidget):
         self._expand_anim.stop()
         self._hover_anim.stop()
         self._watchdog.stop()
+        self._stop_neon_breath()
         self.hide()
         if was_visible:
             # 收起音：若收起前已播过 select/cancel（collapse 显式传入）则不重复，
@@ -2616,6 +3010,14 @@ class DialWindow(QWidget):
         icon_size = float(getattr(self, "_ring_icon_size", 0) or self._num("icon_size", 32))
         font_size = self._num("font_size", 10)
         appear = self.cfg.get("appearance") or {}
+
+        def _fnum(key: str, dflt: float) -> float:
+            """读 appearance 里的浮点参数，缺失/非法值时回退默认。"""
+            try:
+                return float(appear.get(key, dflt))
+            except (TypeError, ValueError):
+                return float(dflt)
+
         try:
             gap_px = float(appear.get("gap_px", 2.4))
         except (TypeError, ValueError):
@@ -2625,6 +3027,34 @@ class DialWindow(QWidget):
                                       appear.get("corner_radius", 9.0)))
         except (TypeError, ValueError):
             corner = 9.0
+        # 配色方案决定圆角口径：classic 用 2*cr 圆头描边把内缩补回，cr 只影响
+        # 四角圆润度；aurora 是纯填充，cr 直接变成扇区之间的缝隙，因此极光
+        # 模式单独用 aurora_corner_px，避免扇区被"顶开"显得松散。
+        scheme = str(appear.get("color_scheme", "classic") or "classic").strip().lower()
+        if scheme == "aurora":
+            corner = _fnum("aurora_corner_px", 3.0)
+        neon: Optional[Dict[str, Any]] = None
+        if scheme == "neon":
+            corner = _fnum("neon_corner_px", 3.0)
+            # 环带宽 / 中心盘 / 外圈霓虹全部按半径等比换算，换 radius 不改观感比例
+            band_ratio = max(0.30, min(0.82, _fnum("neon_band", 0.60)))
+            r = max(16.0, min(R - 24.0, R * (1.0 - band_ratio)))
+            core_ratio = max(0.55, min(0.94, _fnum("neon_core", 0.75)))
+            neon = {
+                "hue": _fnum("neon_hue", 195.0),
+                "band": R - r,
+                "hub_r": r * core_ratio,
+                "fill_a": max(0.0, min(1.0, _fnum("neon_fill_alpha", 0.12))),
+                "fill_hv": max(0.0, min(1.0, _fnum("neon_fill_hover", 0.10))),
+                "line_px": max(0.4, min(4.0, _fnum("neon_line_px", 1.2))),
+                "line_a": max(0.0, min(1.0, _fnum("neon_line_alpha", 0.35))),
+                "line_hv": max(0.0, min(1.0, _fnum("neon_line_hover", 0.30))),
+                "top_a": max(0.0, min(120.0, _fnum("neon_top_alpha", 30.0))),
+                "glow_a": max(0.0, min(1.5, _fnum("neon_glow_alpha", 0.35))),
+                "ring_a": max(0.0, min(1.5, _fnum("neon_ring_alpha", 1.0))),
+                "hub_shadow": max(0.0, min(2.0, _fnum("neon_hub_shadow", 1.0))),
+                "backdrop": max(0.0, min(1.0, _fnum("neon_backdrop", 0.80))),
+            }
         # 扇区越多，单个扇区的可用角度越小：自动缩小图标/字号，避免挤压重叠
         dense = max(0.62, 8.0 / n) if n > 8 else 1.0
         icon_size = max(14.0, icon_size * dense)
@@ -2639,6 +3069,9 @@ class DialWindow(QWidget):
         cx, cy = self._center.x(), self._center.y()
         font = QFont("Microsoft YaHei UI")
         font.setPixelSize(label_px)
+        if scheme == "neon":
+            # 原型 letter-spacing:1px（14px 字 / 150px 槽位宽），按字号等比换算
+            font.setLetterSpacing(QFont.AbsoluteSpacing, max(0.3, label_px * 0.07))
         return {
             "n": n, "R": R, "r": r, "icon_size": icon_size, "font_size": font_size,
             "label_px": label_px, "span": span, "gap": gap, "corner": cr,
@@ -2651,6 +3084,12 @@ class DialWindow(QWidget):
             "accent": self._color("accent", "#4FC3F7", int(self._cfg_alpha("accent_alpha", 225))),
             "warn": self._color("warn", "#FF8A65", 235),
             "text": self._color("text", "#EAF1F8", 240),
+            "scheme": scheme,
+            "neon": neon,
+            "hub_r": float(neon["hub_r"]) if neon else float(r),
+            "aurora_side": _fnum("aurora_side_px", 4.4),
+            "aurora_spec": _fnum("aurora_specular", 1.0),
+            "aurora_groove": _fnum("aurora_groove", 1.0),
         }
 
 
@@ -2698,6 +3137,19 @@ class DialWindow(QWidget):
         path.arcTo(o_rect, q_start, q_span)
         path.arcTo(i_rect, q_start + q_span, -q_span)
         path.closeSubpath()
+
+        # 极光配色走挤出体积绘制（侧壁 + 顶面 + 镜面高光 + 内壁暗槽），
+        # 与原磨砂玻璃是两条独立绘制路径，靠 appearance.color_scheme 切换。
+        if geo.get("scheme") == "aurora" and not is_empty:
+            self._draw_sector_aurora(p, geo, i, selected, hv, path, Ro, Ri)
+            self._draw_sector_content(p, geo, i, selected)
+            return
+
+        # 科技霓虹：单一半透明玻璃填充 + 1.2px 细描边 + 外缘高光 + 霓虹外发光
+        if geo.get("scheme") == "neon" and geo.get("neon"):
+            self._draw_sector_neon(p, geo, i, selected, hv, path, Ro, Ri, is_empty)
+            self._draw_sector_content(p, geo, i, selected)
+            return
 
         if selected:
             fill = QColor(accent)
@@ -2761,6 +3213,318 @@ class DialWindow(QWidget):
 
         self._draw_sector_content(p, geo, i, selected)
 
+    def _draw_sector_aurora(self, p: QPainter, geo: Dict[str, Any], i: int,
+                            selected: bool, hv: float, path: QPainterPath,
+                            Ro: float, Ri: float) -> None:
+        """极光玻璃扇区：挤出厚度侧壁 + 顶面渐变 + 外缘镜面高光 + 内壁暗槽。
+
+        侧壁 = union(A, A') - (A ∩ A')，A' 为 A 沿右下方向平移（2D 挤出）。
+        垂直于挤出方向的边自然变宽、平行的边自然变窄，侧壁宽度随轮廓朝向
+        连续变化，不需要手工凑环形渐变；顶面 + 侧壁叠起来，一个扇区的径向
+        剖面才有多次亮度跳变，也才像一块玻璃砖而不是一张贴图。
+        """
+        cx, cy = geo["cx"], geo["cy"]
+        n = max(1, int(geo["n"]))
+        accent = QColor(geo["accent"])
+        if not accent.isValid():
+            accent = QColor("#5FD8FF")
+        accent.setAlpha(255)
+
+        side = max(1.2, min(10.0, float(geo.get("aurora_side", 4.4))))
+        dx, dy = side * 0.70, side
+        # 各环带宽度按半径等比缩放（原型口径 R=372 时 spec 21px、暗槽 16px）
+        u = max(0.30, min(2.40, Ro / 372.0))
+        spec_coef = max(0.4, min(1.6, float(geo.get("aurora_spec", 1.0))))
+        groove_coef = max(0.3, min(1.8, float(geo.get("aurora_groove", 1.0))))
+
+        k = aurora_sector_light(i, n) * (1.10 if selected else 1.0)
+        k *= 1.0 + 0.06 * max(0.0, min(1.0, hv))
+
+        def C(c, f=1.0, a=1.0):
+            """按扇区受光系数统一调制颜色；a 为 alpha 缩放。
+
+            注意 a 是必需的：specular 色标 RGB 已接近 255，只乘 RGB 会被
+            截断回 255，参数等于失效，必须靠 alpha 调节高光分量。
+            """
+            col = QColor(c)
+            return QColor(min(255, int(col.red() * f * k)),
+                          min(255, int(col.green() * f * k)),
+                          min(255, int(col.blue() * f * k)),
+                          max(0, min(255, int(col.alpha() * a))))
+
+        # ---- 1) 挤出侧壁：玻璃砖的厚度本体，只在右下方向露出
+        moved = path.translated(dx, dy)
+        wall = path.united(moved).subtracted(path.intersected(moved))
+        sg = QLinearGradient(QPointF(cx - Ro, cy - Ro),
+                             QPointF(cx + Ro * 0.9, cy + Ro * 1.1))
+        sg.setColorAt(0.00, C(QColor(38, 104, 128, 250)))
+        sg.setColorAt(0.45, C(QColor(20, 52, 68, 250)))
+        sg.setColorAt(1.00, C(QColor(12, 30, 40, 252)))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(sg))
+        p.drawPath(wall)
+
+        # 侧壁与顶面的接缝：一道极细亮线，厚度才"立"得起来
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(C(QColor(132, 216, 240, 255), 0.86, 0.18),
+                      max(0.8, min(2.0, 1.4 * u + 0.6))))
+        p.drawPath(moved)
+
+        # ---- 2) 顶面
+        g = QLinearGradient(QPointF(cx - Ro, cy - Ro),
+                            QPointF(cx + Ro * 0.85, cy + Ro))
+        g.setColorAt(0.00, C(QColor(78, 140, 166, 188)))
+        g.setColorAt(0.30, C(QColor(58, 116, 140, 168)))
+        g.setColorAt(0.62, C(QColor(38, 86, 106, 150)))
+        g.setColorAt(1.00, C(QColor(20, 50, 64, 136)))
+        p.setBrush(QBrush(g))
+        p.setPen(Qt.NoPen)
+        p.drawPath(path)
+
+        def _ring(r0, r1):
+            outer = QPainterPath()
+            outer.addEllipse(QRectF(cx - r1, cy - r1, r1 * 2, r1 * 2))
+            hole = QPainterPath()
+            hole.addEllipse(QRectF(cx - r0, cy - r0, r0 * 2, r0 * 2))
+            return outer.subtracted(hole)
+
+        p.save()
+        p.setClipPath(path)
+
+        # a) 顶面边缘内侧压暗：只留内侧半笔宽，形成中间微凸、四周微凹的圆润顶面
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(C(QColor(4, 16, 24, 96)), max(6.0, 21.0 * u)))
+        p.drawPath(path)
+
+        # b) 外缘 specular：玻璃外表面反射，左上最亮可近白。
+        #    高光"分量" = 亮带面积 × 不透明度，所以 spec_coef 同时加宽亮带、
+        #    提高 alpha；峰值本身由 RGB 决定，早已到 255，不必也不能再加。
+        band = 28.0 * u * (0.72 + 0.30 * spec_coef)
+        spec = QLinearGradient(QPointF(cx - Ro, cy - Ro),
+                               QPointF(cx + Ro * 0.35, cy + Ro * 0.55))
+        spec.setColorAt(0.00, C(QColor(178, 234, 252, 255), 1.0, 0.20 * spec_coef))
+        spec.setColorAt(0.28, C(QColor(150, 222, 246, 255), 1.0, 0.12 * spec_coef))
+        spec.setColorAt(0.60, C(QColor(104, 196, 228, 255), 1.0, 0.05 * spec_coef))
+        spec.setColorAt(1.00, C(QColor(64, 164, 206, 255), 1.0, 0.01 * spec_coef))
+        p.fillPath(_ring(Ro - band, Ro).intersected(path), spec)
+
+        # c) 内壁暗槽：靠内径压暗，与侧壁一起构成"内孔也是厚的"。
+        #    槽宽与不透明度一起随 groove_coef 走，参数才有真实调节区间。
+        gw = 16.0 * u * (0.72 + 0.28 * groove_coef)
+        p.fillPath(_ring(Ri, Ri + gw).intersected(path),
+                   C(QColor(4, 14, 22, 196), 1.0, groove_coef))
+
+        # d) 内缘反光：暗槽内侧一道青色溢光，光在玻璃内部折回
+        glow_in = QLinearGradient(QPointF(cx, cy + Ri),
+                                  QPointF(cx, cy - Ri * 0.2))
+        glow_in.setColorAt(0.00, C(QColor(96, 214, 246, 86)))
+        glow_in.setColorAt(1.00, C(QColor(72, 196, 232, 0)))
+        p.fillPath(_ring(Ri + 9.0 * u, Ri + 30.0 * u).intersected(path), glow_in)
+
+        # e) 底部环境溢光
+        bot = QLinearGradient(QPointF(cx, cy + Ro), QPointF(cx, cy - Ro * 0.1))
+        bot.setColorAt(0.00, C(QColor(61, 199, 245, 38)))
+        bot.setColorAt(1.00, C(QColor(61, 199, 245, 0)))
+        p.fillPath(path, bot)
+
+        p.restore()
+
+        # ---- 3) 边缘内发光：贴着顶面轮廓的青色细亮边
+        p.setBrush(Qt.NoBrush)
+        for width, alpha in ((9.5, 10), (4.6, 26), (2.4, 58)):
+            c = QColor(accent)
+            c.setAlpha(min(255, int(alpha * 1.45)) if selected else alpha)
+            pen = QPen(c, width * max(0.55, min(1.5, u + 0.35)))
+            pen.setJoinStyle(Qt.RoundJoin)
+            pen.setCapStyle(Qt.RoundCap)
+            p.setPen(pen)
+            p.drawPath(path)
+
+        if selected:
+            # 选中态：内部薄薄叠一层青光 + 一道锐白边，只提亮不加宽
+            p.save()
+            p.setClipPath(path)
+            p.setPen(Qt.NoPen)
+            glow = QRadialGradient(QPointF(cx, cy), Ro)
+            glow.setColorAt(0.58, QColor(61, 199, 245, 0))
+            glow.setColorAt(1.00, QColor(61, 199, 245, 44))
+            p.setBrush(QBrush(glow))
+            p.drawRect(QRectF(cx - Ro - 4, cy - Ro - 4,
+                              (Ro + 4) * 2, (Ro + 4) * 2))
+            p.restore()
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(QColor(198, 242, 255, 112), 1.7))
+            p.drawPath(path)
+
+    def _draw_sector_neon(self, p: QPainter, geo: Dict[str, Any], i: int,
+                          selected: bool, hv: float, path: QPainterPath,
+                          Ro: float, Ri: float, is_empty: bool) -> None:
+        """科技霓虹扇区：原型 SlotButton.paintEvent 的逐项等比换算。
+
+        原型每个槽位卡片是：
+            底色  hsla(HUE, 30, 60, 0.12 + 0.10*hover)
+            描边  hsla(HUE, 80, 75, 0.35 + 0.30*hover)，宽 1.2
+            高光  白 alpha (30 + 30*hover) -> 0，覆盖上半部
+            外发光 blur 16，hsla(HUE, 90, 60, 0.35)
+        这里保持同一套数值，只做两处必要适配：
+          1) "顶部高光"改成"外缘高光"——连续环的视觉光源在径向外侧；
+          2) 原型的外发光是常驻的，在 1.5px 细缝的连续环上会把缝糊死，
+             所以常驻部分压到极淡，选中/悬停时才完整给三层。
+        """
+        n = geo["neon"]
+        hue = n["hue"]
+        cx, cy = geo["cx"], geo["cy"]
+        band = max(1.0, float(n["band"]))
+        hv = max(0.0, min(1.0, float(hv)))
+        k = 1.0 if selected else hv            # 选中视作完全高亮
+
+        p.save()
+        p.setRenderHint(QPainter.Antialiasing, True)
+
+        # ---- 1) 半透明玻璃底（原型 bg = hsla(HUE,30,60,0.12+0.10*hover)）
+        fill_a = n["fill_a"] + n["fill_hv"] * k
+        if is_empty:
+            fill_a *= 0.45                     # 空槽位更淡，一眼可辨
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(_hsla(hue, 30, 60, min(1.0, fill_a))))
+        p.drawPath(path)
+
+        # ---- 2) 外缘高光（原型顶部线性高光，覆盖近半张卡片）
+        top_a = n["top_a"] * (1.0 + k)
+        if top_a > 0.5:
+            p.save()
+            p.setClipPath(path)
+            grad = QRadialGradient(QPointF(cx, cy), max(1.0, Ro))
+            edge = 1.0 - (band * 0.5) / max(1.0, Ro)
+            grad.setColorAt(max(0.0, min(1.0, edge)), QColor(255, 255, 255, 0))
+            grad.setColorAt(1.0, QColor(255, 255, 255, int(max(0, min(255, top_a)))))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(grad))
+            p.drawRect(QRectF(cx - Ro - 2, cy - Ro - 2, (Ro + 2) * 2, (Ro + 2) * 2))
+            p.restore()
+
+        # ---- 3) 外发光（原型 drop shadow blur 16 / 0.35）
+        glow_a = n["glow_a"] * 255.0
+        if selected:
+            layers = ((band * 0.13, 0.09), (band * 0.07, 0.16), (band * 0.033, 0.35))
+        elif hv > 0.05:
+            layers = ((band * 0.09, 0.05 * hv),)
+        else:
+            layers = ((band * 0.05, 0.012),)   # 常驻极淡一档，只提"发光体"感觉
+        p.setBrush(Qt.NoBrush)
+        for width, coef in layers:
+            a = int(max(0, min(255, glow_a * coef)))
+            if a <= 0:
+                continue
+            pen = QPen(_hsla(hue, 90, 60, a / 255.0), max(0.8, width))
+            pen.setJoinStyle(Qt.RoundJoin)
+            p.setPen(pen)
+            p.drawPath(path)
+
+        # ---- 4) 细描边（原型 pen 1.2 / 0.35 + 0.30*hover）
+        line_a = n["line_a"] + n["line_hv"] * k
+        pen = QPen(_hsla(hue, 80, 75, max(0.0, min(1.0, line_a))),
+                   max(0.4, float(n["line_px"])))
+        pen.setJoinStyle(Qt.RoundJoin)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawPath(path)
+
+        p.restore()
+
+    def _draw_icon_plate_neon(self, p: QPainter, ix: float, iy: float,
+                              icon_size: float, selected: bool, hue: float) -> None:
+        """科技霓虹图标底板：原型 rgba(255,255,255,0.10) + 圆角 14/52 的玻璃格。
+
+        原型底板 52px 托 26px 图标（2.0 倍），圆角 14（0.269 倍），这里等比换算，
+        底板尺寸随 icon_size 自动跟随，不会出现"图标大底板小"的错位。
+        """
+        box_w = icon_size * 2.0
+        rad = max(4.0, box_w * 0.269)
+        box = QRectF(ix - box_w / 2.0, iy - box_w / 2.0, box_w, box_w)
+        a = 0.10 + (0.06 if selected else 0.0)
+        p.setPen(Qt.NoPen)
+        p.setBrush(_hsla(hue, 30, 92, a))
+        p.drawRoundedRect(box, rad, rad)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(_hsla(hue, 70, 80, 0.16 if selected else 0.10), 0.9))
+        p.drawRoundedRect(box, rad, rad)
+
+    def _draw_neon_backdrop(self, p: QPainter, geo: Dict[str, Any]) -> None:
+        """深空径向背衬：让霓虹"有地方发光"，否则青色细线落在亮壁纸上会消失。
+
+        原型是整窗矩形填深空渐变（16,34,46 -> 6,13,20 -> 2,6,10）；
+        悬浮窗不能出现方形硬边，所以改成圆形径向、外圈淡到 0，
+        边缘自然融进桌面。neon_backdrop 可调 0 完全关闭。
+        """
+        n = geo["neon"]
+        k = float(n["backdrop"])
+        if k <= 0.01:
+            return
+        R, cx, cy = geo["R"], geo["cx"], geo["cy"]
+        hue = n["hue"]
+        outer = R * 1.22
+        grad = QRadialGradient(QPointF(cx, cy - R * 0.10), outer)
+        grad.setColorAt(0.00, _hsla(hue, 45, 12, 0.94 * k))
+        grad.setColorAt(0.55, _hsla(hue, 55, 5, 0.86 * k))
+        grad.setColorAt(0.86, _hsla(hue, 60, 2, 0.42 * k))
+        grad.setColorAt(1.00, _hsla(hue, 60, 2, 0.0))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(grad))
+        p.drawEllipse(QPointF(cx, cy - R * 0.10), outer, outer)
+
+    def _draw_neon_ring(self, p: QPainter, geo: Dict[str, Any]) -> None:
+        """外圈霓虹发光圆环：多层描边模拟外发光 + 呼吸亮度（原型 3200ms / 0.85~1.0）。"""
+        n = geo["neon"]
+        R, cx, cy = geo["R"], geo["cx"], geo["cy"]
+        glow = float(getattr(self, "_neon_glow", 1.0)) * float(n["ring_a"])
+        if glow <= 0.01:
+            return
+        base = R * 1.024              # 原型 radius = WHEEL/2 - 24 = 256，环外径 250
+        #                               → 外圈落在环外径外 6px（6/250 = 0.024R）
+        peak = int(max(0, min(255, 255 * glow)))
+        p.save()
+        p.setBrush(Qt.NoBrush)
+        for spread, coef in ((0.0, 1.00), (R * 0.0096, 1.00), (R * 0.024, 0.42),
+                             (R * 0.060, 0.16)):
+            a = int(peak * coef)
+            if a <= 0:
+                continue
+            pen = QPen(_hsla(n["hue"], 90, 60, a / 255.0), 1.5)
+            p.setPen(pen)
+            rr = base + spread
+            p.drawEllipse(QPointF(cx, cy), rr, rr)
+        p.restore()
+
+    def _draw_icon_plate(self, p: QPainter, ix: float, iy: float,
+                         icon_size: float, selected: bool) -> None:
+        """极光模式下的图标玻璃底板：让图标"嵌"进扇区，而不是拍在表面上。"""
+        pad = max(3.0, icon_size * 0.17)
+        box = QRectF(ix - icon_size / 2.0 - pad, iy - icon_size / 2.0 - pad,
+                     icon_size + pad * 2, icon_size + pad * 2)
+        rad = max(4.0, min(box.width() * 0.34, icon_size * 0.30))
+        pg = QLinearGradient(box.topLeft(), box.bottomRight())
+        pg.setColorAt(0.00, QColor(196, 240, 255, 52 if selected else 36))
+        pg.setColorAt(0.50, QColor(140, 212, 240, 18))
+        pg.setColorAt(1.00, QColor(86, 168, 208, 8))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(pg))
+        p.drawRoundedRect(box, rad, rad)
+
+        # 底板顶部反光：一块玻璃的上半部总是更亮
+        p.setBrush(QColor(206, 242, 255, 20 if selected else 13))
+        p.drawRoundedRect(QRectF(box.left() + 2, box.top() + 1.2,
+                                 box.width() - 4, box.height() * 0.34), rad, rad)
+
+        # 底板边光：上亮下暗，延续左上方向光
+        p.setBrush(Qt.NoBrush)
+        eg = QLinearGradient(box.topLeft(), box.bottomLeft())
+        eg.setColorAt(0.00, QColor(150, 220, 242, 30))
+        eg.setColorAt(1.00, QColor(96, 176, 212, 6))
+        p.setPen(QPen(QBrush(eg), max(0.8, min(1.05, icon_size / 30.0))))
+        p.drawRoundedRect(box, rad, rad)
+
     def _draw_sector_content(self, p: QPainter, geo: Dict[str, Any], i: int,
                              selected: bool) -> None:
         """扇区的图标/文案/空位圆点（与扇区形状分离，便于缓存路径单独补画）。"""
@@ -2777,6 +3541,11 @@ class DialWindow(QWidget):
         icon_r = (r + R) * 0.5
         ix, iy = cx + ux * icon_r, cy + uy * icon_r
         if not is_empty:
+            if geo.get("scheme") == "aurora":
+                self._draw_icon_plate(p, ix, iy, icon_size, selected)
+            elif geo.get("scheme") == "neon":
+                self._draw_icon_plate_neon(p, ix, iy, icon_size, selected,
+                                           float(geo["neon"]["hue"]))
             pm = self.icons.get(item, int(icon_size), getattr(self, "_ring_key", ""))
             if not pm.isNull():
                 p.drawPixmap(QPointF(ix - pm.width() / 2.0, iy - pm.height() / 2.0), pm)
@@ -2792,14 +3561,14 @@ class DialWindow(QWidget):
                            Qt.AlignHCenter | Qt.AlignTop, txt)
         else:
             # 空槽位：虚线圆 + 加号，视觉上明确「可在此配置程序」
-            pen = QPen(QColor(255, 255, 255, 62), 1.4)
+            pen = QPen(QColor(168, 220, 240, 54), 1.4)
             pen.setStyle(Qt.DashLine)
             pen.setDashPattern([2.4, 2.4])
             p.setPen(pen)
             p.setBrush(Qt.NoBrush)
             rr = max(9.0, icon_size * 0.30)
             p.drawEllipse(QRectF(ix - rr, iy - rr, rr * 2, rr * 2))
-            p.setPen(QPen(QColor(255, 255, 255, 84), 1.4))
+            p.setPen(QPen(QColor(168, 220, 240, 70), 1.4))
             p.drawLine(QPointF(ix - rr * 0.45, iy), QPointF(ix + rr * 0.45, iy))
             p.drawLine(QPointF(ix, iy - rr * 0.45), QPointF(ix, iy + rr * 0.45))
 
@@ -2813,23 +3582,75 @@ class DialWindow(QWidget):
         cr = self._cancel_radius()  # 与 update_pointer 的取消判定同源
         p.drawEllipse(QRectF(geo["cx"] - cr, geo["cy"] - cr, cr * 2, cr * 2))
 
+    def _draw_hub_neon(self, p: QPainter, geo: Dict[str, Any],
+                       cx: float, cy: float, hub_r: float) -> None:
+        """科技霓虹中心盘：玻璃拟态 + 三层外发光（原型 CoreButton 逐项换算）。
+
+        原型：
+            外发光 QGraphicsDropShadowEffect blur 25 / hsla(HUE,90,60,0.45)
+            盘面   QRadialGradient(0.35D, 0.30D, 0.7D)：白 0.16 -> rgb(20,35,45,0.82)
+            描边   hsla(HUE,80,75,0.40)，宽 1.5
+        D 取中心盘直径，所有偏移与半径都按比例换算，改 neon_core 不会跑形。
+        """
+        n = geo["neon"]
+        hue = n["hue"]
+        D = max(8.0, hub_r * 2.0)
+        ctr = QPointF(cx, cy)
+
+        # ---- 外发光：三层递进模拟 blur 25 的衰减（由外到内越来越实）
+        shadow = float(n["hub_shadow"]) * 255.0
+        p.setBrush(Qt.NoBrush)
+        for width, coef in ((hub_r * 0.30, 0.10), (hub_r * 0.16, 0.22),
+                            (hub_r * 0.07, 0.46)):
+            a = int(max(0, min(255, shadow * coef)))
+            if a <= 0:
+                continue
+            p.setPen(QPen(_hsla(hue, 90, 60, a / 255.0), max(1.0, width)))
+            p.drawEllipse(ctr, hub_r, hub_r)
+
+        # ---- 盘面：径向渐变（光源偏左上 0.35D/0.30D）
+        off = QPointF(cx + D * (0.35 - 0.5), cy + D * (0.30 - 0.5))
+        grad = QRadialGradient(off, max(1.0, D * 0.70))
+        grad.setColorAt(0.00, QColor(255, 255, 255, 40))
+        grad.setColorAt(1.00, QColor(20, 35, 45, 210))
+        p.setPen(Qt.NoPen)
+        p.setBrush(QBrush(grad))
+        p.drawEllipse(ctr, hub_r, hub_r)
+
+        # ---- 描边：默认 0.40，选中/取消时提亮，保留原有交互反馈
+        if self._cancel:
+            pen_c = _hsla(20, 90, 66, 0.85)          # 松开取消 -> 暖色警示
+        elif self._sel >= 0:
+            pen_c = _hsla(hue, 95, 72, 0.90)         # 有选中 -> 霓虹提亮
+        else:
+            pen_c = _hsla(hue, 80, 75, 0.40)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(pen_c, 1.5))
+        p.drawEllipse(ctr, hub_r, hub_r)
+
     def _draw_hub(self, p: QPainter, geo: Dict[str, Any], fade: float = 1.0) -> None:
         """中心圆盘：常显当前环名 + 选中项名称 + 类型/快捷键 + 环指示点（动态层）。"""
         cx, cy, r = geo["cx"], geo["cy"], geo["r"]
+        hub_r = float(geo.get("hub_r", r) or r)
         fm, base, accent = geo["fm"], geo["base"], geo["accent"]
         text_color, font_size = geo["text"], geo["font_size"]
-        hub = QColor(base)
-        hub.setAlpha(min(255, int(self._cfg_alpha("base_alpha", 205)) + 25))
-        p.setBrush(hub)
-        p.setPen(QPen(accent if self._sel >= 0 and not self._cancel
-                      else QColor(255, 255, 255, 46), 1.4))
-        p.drawEllipse(geo["inner_rect"])
+        neon = geo.get("neon")
+        if neon:
+            # 科技霓虹：中心玻璃拟态圆盘（原型 CoreButton 的径向渐变 + 外发光）
+            self._draw_hub_neon(p, geo, cx, cy, hub_r)
+        else:
+            hub = QColor(base)
+            hub.setAlpha(min(255, int(self._cfg_alpha("base_alpha", 205)) + 25))
+            p.setBrush(hub)
+            p.setPen(QPen(accent if self._sel >= 0 and not self._cancel
+                          else QColor(255, 255, 255, 46), 1.4))
+            p.drawEllipse(geo["inner_rect"])
 
         total = max(1, int(getattr(self, "_ring_total", 1)))
         idx = int(getattr(self, "_ring_index", 0))
         ring_name = str(getattr(self, "_ring_name", ""))
         prev_name = str(getattr(self, "_ring_prev_name", "") or "")
-        tw = r * 1.72
+        tw = hub_r * 1.72
 
         title = ""
         hint = ""
@@ -2994,6 +3815,10 @@ class DialWindow(QWidget):
         sel = self._sel if not self._cancel else -1
         fade = getattr(self, "_ring_fade", 1.0)
         prev_items = getattr(self, "_ring_prev_items", None)
+        neon_on = bool(geo.get("neon"))
+        if neon_on:
+            # 深空背衬画在最底层且不参与展开缩放：霓虹细线需要暗底才发得出来
+            self._draw_neon_backdrop(p, geo)
 
         if fade >= 0.999 or not prev_items:
             cached = None
@@ -3002,6 +3827,8 @@ class DialWindow(QWidget):
             if cached is not None:
                 # 静态层：一次位图合成，省掉 8 个扇区路径 + 图标 + 文案的重绘
                 p.drawPixmap(QPoint(0, 0), cached)
+                if neon_on:
+                    self._draw_neon_ring(p, geo)
                 self._draw_cancel_ring(p, geo)
                 if sel >= 0:
                     self._draw_sector(p, geo, sel, True, hv)
@@ -3013,6 +3840,8 @@ class DialWindow(QWidget):
                 self._draw_cancel_ring(p, geo)
                 for i in range(geo["n"]):
                     self._draw_sector(p, geo, i, (i == self._sel and not self._cancel), hv)
+                if neon_on:
+                    self._draw_neon_ring(p, geo)
             self._draw_hub(p, geo)
         else:
             # 切环过渡：旧环淡出 + 新环淡入。过渡期间绕过静态层缓存
@@ -3025,6 +3854,8 @@ class DialWindow(QWidget):
             self._draw_cancel_ring(p, geo)
             self._draw_sector_layer(p, geo, prev_items, 1.0 - fade, -1, 0.0)
             self._draw_sector_layer(p, geo, self._items, fade, sel, hv)
+            if neon_on:
+                self._draw_neon_ring(p, geo)
             p.restore()
             self._draw_hub(p, geo, fade)
         p.end()
@@ -3508,7 +4339,7 @@ class SettingsDialog(QDialog):
         self.nav.setMaximumWidth(self._nav_max_width())
         self.nav.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.nav.setWordWrap(True)
-        for text in ("通用", "启动器"):
+        for text in ("通用", "启动器", "关于"):
             self.nav.addItem(QListWidgetItem(text))
         self.nav.setCurrentRow(1)
         self._body.addWidget(self.nav)
@@ -3522,7 +4353,8 @@ class SettingsDialog(QDialog):
 
         # 每个设置页各自套一层 QScrollArea：小窗口时出滚动条而不是挤压控件
         self._page_widgets: List[QWidget] = []
-        for builder in (self._build_general_page, self._build_launcher_page):
+        for builder in (self._build_general_page, self._build_launcher_page,
+                        self._build_about_page):
             page = builder()
             self._page_widgets.append(page)
             self.stack.addWidget(_wrap_scroll(page))
@@ -3732,6 +4564,10 @@ class SettingsDialog(QDialog):
             self._persist_window_state()
         except Exception as exc:
             log.warning("窗口状态保存异常：%s", exc)
+        try:
+            self.sound.close()          # 释放常驻音频声道
+        except Exception:
+            pass
         super().closeEvent(event)
 
     # ============================================================ 通用页
@@ -3759,6 +4595,12 @@ class SettingsDialog(QDialog):
             self.cmb_accent.addItem(name, hexv)
         _fit_combo(self.cmb_accent, 8)
         f1.addRow("强调色", self.cmb_accent)
+        self.cmb_scheme = QComboBox(gb1)
+        self.cmb_scheme.addItem("经典磨砂玻璃", "classic")
+        self.cmb_scheme.addItem("极光玻璃（厚度侧壁）", "aurora")
+        self.cmb_scheme.addItem("科技霓虹（青蓝呼吸光）", "neon")
+        _fit_combo(self.cmb_scheme, 12)
+        f1.addRow("配色方案", self.cmb_scheme)
         self.spin_sectors = QSpinBox(gb1)
         self.spin_sectors.setRange(3, 16)
         _fit_spin(self.spin_sectors, "16")
@@ -3829,6 +4671,53 @@ class SettingsDialog(QDialog):
         f3.addRow("", self.chk_keys)
         label_w = max(label_w, _polish_form(f3, label_w))
         lay.addWidget(gb3)
+        lay.addStretch(1)
+        return page
+
+    # ============================================================ 关于页
+    def _open_link(self, url: str) -> None:
+        """用系统默认浏览器打开链接；失败只记日志，不影响设置窗口。"""
+        url = str(url or "").strip()
+        if not url:
+            return
+        log.info("打开链接：%s", url)
+        QDesktopServices.openUrl(QUrl(url))
+
+    def _build_about_page(self) -> QWidget:
+        page = QWidget(self)
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(2, 2, 12, 2)
+        lay.setSpacing(12)
+        label_w = 0
+
+        # 程序信息：名称 / 版本 / 作者 / 许可证
+        gb1 = QGroupBox("程序信息", page)
+        f1 = QFormLayout(gb1)
+        f1.addRow("名称", QLabel("%s（DesktopDial）" % APP_TITLE, gb1))
+        lbl_ver = QLabel("v%s" % APP_VERSION, gb1)
+        lbl_ver.setToolTip("程序版本号，与 README、Release 保持一致")
+        f1.addRow("版本", lbl_ver)
+        f1.addRow("作者", QLabel("Jacky", gb1))
+        f1.addRow("许可证", QLabel("GNU GPLv3", gb1))
+        label_w = max(label_w, _polish_form(f1, label_w))
+        lay.addWidget(gb1)
+
+        # 开源地址：可点击链接 + 按钮（均调系统浏览器）
+        gb2 = QGroupBox("开源地址", page)
+        f2 = QFormLayout(gb2)
+        lbl_url = QLabel('<a href="%s">%s</a>' % (PROJECT_URL, PROJECT_URL), gb2)
+        lbl_url.setOpenExternalLinks(False)
+        lbl_url.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.LinksAccessibleByMouse)
+        lbl_url.linkActivated.connect(self._open_link)
+        f2.addRow("GitHub", lbl_url)
+        self.btn_about_open = QPushButton("在浏览器中打开", gb2)
+        self.btn_about_open.setToolTip(PROJECT_URL)
+        self.btn_about_open.clicked.connect(lambda: self._open_link(PROJECT_URL))
+        f2.addRow("", self.btn_about_open)
+        label_w = max(label_w, _polish_form(f2, label_w))
+        lay.addWidget(gb2)
+
         lay.addStretch(1)
         return page
 
@@ -4343,6 +5232,9 @@ class SettingsDialog(QDialog):
             self.cmb_theme.itemData(i) for i in range(self.cmb_theme.count())] else 0)
         appear = self.cfg.get("appearance") or {}
         self.chk_frost.setChecked(bool(appear.get("frosted", True)))
+        _scheme = str(appear.get("color_scheme", "classic") or "classic").strip().lower()
+        _sidx = self.cmb_scheme.findData(_scheme)
+        self.cmb_scheme.setCurrentIndex(_sidx if _sidx >= 0 else 0)
         accent = str((self.cfg.get("colors") or {}).get("accent", "#4FC3F7"))
         idx = self.cmb_accent.findData(accent)
         self.cmb_accent.setCurrentIndex(idx if idx >= 0 else 0)
@@ -4384,6 +5276,7 @@ class SettingsDialog(QDialog):
             self.cfg["theme"]["mode"] = mode
         appear = self.cfg.setdefault("appearance", {})
         appear["frosted"] = bool(self.chk_frost.isChecked())
+        appear["color_scheme"] = str(self.cmb_scheme.currentData() or "classic")
         appear["gap_px"] = round(float(self.spin_gap.value()), 2)
         self.cfg.setdefault("colors", {})["accent"] = str(
             self.cmb_accent.currentData() or "#4FC3F7")

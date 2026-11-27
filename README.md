@@ -26,6 +26,7 @@
 | 全局热键 | 默认 `Ctrl+Alt+Space`，任意窗口下在光标处唤出圆盘 |
 | 音效 | 3 套主题共 60+ 个程序合成音效（玻璃 / 机械 / 极简），悬停音高随扇区递进 |
 | 图形配置窗 | 内置设置窗口：常规、外观、音效、热键、圆环与槽位编辑，改完即时热应用到运行中的圆盘 |
+| 关于页 | 设置窗「关于」页显示程序版本号（v1.1.0）与 GitHub 开源地址，点击即可在浏览器打开 |
 | 托盘左键菜单 | 左键单击托盘图标即弹完整菜单（不再必须右键），双击托盘直接唤出圆盘 |
 | 无侵入 | 不写注册表、不装服务、不建计划任务、不需要管理员权限 |
 
@@ -132,9 +133,9 @@ copy example_config.json desktop_dial_config.json
 |---|---|---|
 | `version` | `2` | 配置结构版本 |
 | `sectors` | `8` | 扇区数，建议 4 / 6 / 8 / 12；条目多于扇区则忽略多余，少于扇区则留空位 |
-| `radius` | `168` | 外半径（逻辑像素，已按系统 DPI 缩放换算） |
+| `radius` | `200` | 外半径（逻辑像素，已按系统 DPI 缩放换算） |
 | `inner_radius` | `52` | 中心圆盘半径（死区基准） |
-| `icon_size` | `32` | 图标边长；扇区数 > 8 时自动缩小防挤压 |
+| `icon_size` | `18` | 图标边长；扇区数 > 8 时自动缩小防挤压 |
 | `font_size` | `10` | 标签字号，同样随扇区数自动缩放 |
 | `drag_threshold` | `12` | 唤起阈值：位移超过该值（物理像素）才弹圆盘 |
 | `cancel_margin` | `70` | 取消余量：超出 `radius + cancel_margin` 视为取消 |
@@ -151,11 +152,53 @@ copy example_config.json desktop_dial_config.json
 |---|---|---|
 | `theme` | `follow_system` / `mode`（`auto`·`dark`·`light`） | 是否跟随系统深浅色，或强制指定 |
 | `colors` | `base` `base_alpha` `empty_alpha` `accent` `accent_alpha` `text` `warn` | 底色/空扇区透明度/强调色/文字/取消提示色（`#RRGGBB` + 0–255 alpha） |
-| `sound` | `enabled` `theme`（`glass`·`mechanical`·`minimal`）`volume` `mute` `backend`（`auto`·`async`·`qsound`）`hover_pitch` `hover_semitone` | 音效开关、主题、音量、播放后端与悬停音高 |
+| `sound` | `enabled` `theme`（`glass`·`mechanical`·`minimal`）`volume` `mute` `backend`（`auto`·`waveout`·`async`·`qsound`）`hover_pitch` `hover_semitone` `hover_min_gap_ms` `hover_cut_min_ms` `max_queue` | 音效开关、主题、音量、播放后端与悬停音高；后三项控制扫扇区时的节流与覆盖 |
 | `hotkey` | `enabled` / `sequence` | 全局热键开关与组合键，如 `Ctrl+Alt+Space` |
 | `animation` | `enabled` `expand_ms` `collapse_ms` `hover_ms` `sector_gain` | 展开/收起/悬停动画时长与扇区放大系数 |
-| `appearance` | `frosted` `glass_alpha` `gap_px` `sector_radius` `hub_name` `glow` `icon_shadow` | 磨砂玻璃、扇区间隙、圆角、中心是否显示名称、外发光、图标阴影 |
+| `appearance` | `frosted` `glass_alpha` `gap_px` `sector_radius` `aurora_corner_px` `hub_name` `glow` `icon_shadow` | 磨砂玻璃、扇区间隙、圆角、极光模式圆角（直接决定扇区贴合紧密度）、中心是否显示名称、外发光、图标阴影 |
+| `appearance` | `color_scheme` `aurora_side_px` `aurora_specular` `aurora_groove` `neon_*` | 配色方案与极光 / 科技霓虹样式参数，详见 4.2.1 |
 | `ui` | `geometry` `maximized` `nav_width` `splitter` | 设置窗口的几何与分栏记忆（由程序自动维护） |
+
+#### 4.2.1 配色方案（`appearance.color_scheme`）
+
+| 取值 | 效果 |
+|---|---|
+| `classic` | 原有磨砂玻璃扇区，平面贴图质感（默认，老配置不受影响） |
+| `aurora` | 极光玻璃扇区：带挤出厚度的立体侧壁、外缘镜面高光、内壁压暗暗槽、图标玻璃底板 |
+| `neon` | 科技霓虹环：深空径向背衬 + 青蓝细线描边 + 外圈呼吸光晕（参数口径 1:1 对齐《科技感环形启动轮盘》原型） |
+
+极光方案的三个配套参数（仅在 `aurora` 下生效，改动后热重载立即生效，无需重启）：
+
+| 字段 | 默认 | 范围 | 说明 |
+|---|---|---|---|
+| `aurora_side_px` | `4` | 2–8 | 侧壁厚度（以基准半径 372px 为参照等比缩放） |
+| `aurora_specular` | `1.15` | 0.6–1.4 | 外缘镜面高光强度：同时放大高光亮带宽度与不透明度，调小更克制、调大更亮更"玻璃" |
+| `aurora_groove` | `1.15` | 0.4–1.6 | 内壁暗槽压暗系数：越大槽越宽越深，立体感更强但内圈偏暗 |
+
+科技霓虹方案（`neon`）的配套参数——每一项都对应原型的字面量，默认值即原型数值（仅 `neon` 下生效，热重载即时生效）：
+
+| 字段 | 默认 | 原型对应 | 说明 |
+|---|---|---|---|
+| `neon_hue` | `195` | `HUE = 195` | 整环色相：195 青蓝 / 265 紫 / 20 金红 |
+| `neon_corner_px` | `3.0` | 槽位 `border-radius 26` | 扇区圆角；连续环上直接等于缝宽，越小越贴合 |
+| `neon_band` | `0.60` | `SLOT_SIZE 150 / 外径 250` | 环带宽占圆盘半径比例 |
+| `neon_core` | `0.75` | `CORE_SIZE 150 / 内径 200` | 中心盘半径占内孔半径比例 |
+| `neon_fill_alpha` | `0.12` | `hsla(HUE,30,60,0.12)` | 槽位底色不透明度 |
+| `neon_fill_hover` | `0.10` | `+0.10*hover` | 悬停额外叠加的底色 |
+| `neon_line_px` | `1.2` | `pen.setWidthF(1.2)` | 槽位描边宽度 |
+| `neon_line_alpha` | `0.35` | `hsla(HUE,80,75,0.35)` | 描边不透明度 |
+| `neon_line_hover` | `0.30` | `+0.3*hover` | 悬停额外叠加的描边亮度 |
+| `neon_top_alpha` | `30` | `QColor(255,255,255,30+30*hover)` | 顶部渐变高光峰值 alpha |
+| `neon_glow_alpha` | `0.35` | `drop shadow 0.35 / blur 16` | 选中扇区外发光强度 |
+| `neon_ring_alpha` | `1.00` | `alpha = 255*glow` | 外圈霓虹峰值亮度倍率 |
+| `neon_breath_ms` | `3200` | `setDuration(3200)` | 呼吸周期（毫秒） |
+| `neon_breath_min` | `0.85` | `0.85 ↔ 1.0` | 呼吸最暗亮度，与峰值往返循环 |
+| `neon_backdrop` | `0.80` | 深空径向渐变背景 | 背衬强度，0 = 关闭（完全透出桌面） |
+| `neon_hub_shadow` | `1.00` | `blur 25 / 0.45` | 中心盘外发光强度倍率 |
+
+外圈半径为 `1.024 × radius`（原型窗口半宽 280 − 24 = 256，环外径 250），可用 `neon_ring_alpha` 控制亮度而不会因缩放半径压到扇区。
+
+也可以在「设置 → 外观」的「配色方案」下拉框直接切换，切换后圆盘立即重绘。原有 `classic` 配置中即使没有这几个键也能正常运行，缺失时按上表默认值处理。
 
 ### 4.3 多圆环与条目
 
@@ -233,6 +276,15 @@ pyinstaller --noconfirm --clean --onedir --windowed ^
 | `data_dir()` | **可写**数据（配置、日志） | 优先 exe 同目录；不可写则 `%APPDATA%\DesktopDial\`。**绝不写 `_MEIPASS`** |
 
 因此新增任何资源文件时：读取用 `resource_dir()`，写入用 `data_dir()`。
+
+**音效后端与出声延迟**：默认 `backend=auto` 会选择常驻 `waveOut` 声道——设备与流只在启动时打开一次，20 个 WAV 启动即读成内存 PCM，每次播放只做「memmove + waveOutWrite」。用 `waveOutGetPosition` 实测从调用到喇叭真实出声：
+
+| 后端 | 调用耗时 | 从调用到真实出声 |
+|---|---|---|
+| `waveout`（默认） | 0.25–0.35 ms | **≈48 ms** |
+| `async`（winsound） | 0.1–3 ms | ≈237 ms（每次重新建流，体感「慢半拍」） |
+
+所以「调用耗时短」不等于「听着不延迟」：winsound 的 P/Invoke 很快，但声卡要等下一次流启动。快速扫扇区时 hover 音会被覆盖打断（`hover_cut_min_ms` 控制最短已播时长，`hover_min_gap_ms` 控制最小间隔，`max_queue` 控制队列深度），队列不会堆积成拖尾。若某些机器上 waveOut 不可用，会自动回退 `async`。
 
 **音效重新生成（可选）**：`sounds/` 下 3 套主题共 60 个 WAV 由项目自带合成脚本用 numpy 生成，运行程序本身**不需要 numpy**，打包时也不会包含它。
 
