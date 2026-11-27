@@ -46,6 +46,7 @@ scratch/
 settings_shots/
 shots/
 sound_cache/
+icon_cache/
 verify*.png
 校验报告*.md
 

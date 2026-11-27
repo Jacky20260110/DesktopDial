@@ -52,6 +52,7 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import logging
 import math
@@ -184,6 +185,22 @@ def data_dir() -> str:
 def sound_cache_dir() -> str:
     """音效音量缩放缓存目录（必须可写，绝不能落在 sys._MEIPASS）。"""
     d = os.path.join(data_dir(), "sound_cache")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        pass
+    return d
+
+
+def icon_cache_dir() -> str:
+    """图标磁盘缓存目录。
+
+    Win32 取一张真实图标要走 COM（SHGetFileInfo + IImageList.GetIcon），
+    冷启动首次弹出时逐格现取会明显拖慢首帧。这里把取到的位图按
+    「路径 + mtime + 尺寸」散列落成 PNG，第二次启动直接读盘，
+    进程间也能复用。
+    """
+    d = os.path.join(data_dir(), "icon_cache")
     try:
         os.makedirs(d, exist_ok=True)
     except OSError:
@@ -1589,10 +1606,93 @@ class IconCache:
 
     IMAGE_EXT = (".png", ".jpg", ".jpeg", ".bmp", ".ico", ".webp", ".svg")
 
+    # 磁盘缓存格式版本：结构变更时 +1，旧文件自然失效
+    ICON_DISK_VERSION = 1
+    DISK_MAX_FILES = 600
+
     def __init__(self) -> None:
         self._provider = QFileIconProvider()
         self._cache: Dict[Tuple[str, int], QPixmap] = {}
         self._source: Dict[Tuple[str, int], str] = {}
+        self._disk_dir = ""
+        self._disk_writes = 0
+        self.disk_hits = 0
+
+    # ---------------------------------------------------------- 磁盘缓存
+    def _disk_dir_ready(self) -> str:
+        if not self._disk_dir:
+            try:
+                self._disk_dir = icon_cache_dir()
+            except Exception:
+                self._disk_dir = ""
+        return self._disk_dir
+
+    def _disk_file(self, key_text: str, size: int, target: str) -> str:
+        """文件名 = f(版本, 槽位内容, 目标 mtime, 尺寸)，目标被替换后自动换名。"""
+        d = self._disk_dir_ready()
+        if not d:
+            return ""
+        stamp = "0"
+        try:
+            if target and os.path.exists(target):
+                stamp = "%.0f" % os.path.getmtime(target)
+        except OSError:
+            stamp = "0"
+        raw = "%d|%s|%d|%s" % (self.ICON_DISK_VERSION, key_text, size, stamp)
+        name = hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()[:20]
+        return os.path.join(d, "%s_%d.png" % (name, size))
+
+    def _disk_load(self, path: str) -> Optional[QPixmap]:
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            pm = QPixmap(path)
+        except Exception:
+            return None
+        if pm.isNull():
+            return None
+        return pm
+
+    def _disk_save(self, path: str, pm: Optional[QPixmap]) -> None:
+        if not path or pm is None or pm.isNull():
+            return
+        try:
+            tmp = path + ".tmp"
+            if not pm.save(tmp, "PNG"):
+                return
+            os.replace(tmp, path)      # 原子替换，避免并发读到半截文件
+            self._disk_writes += 1
+            if self._disk_writes % 200 == 0:
+                self.purge_disk()
+        except Exception:
+            log.debug("图标磁盘缓存写入失败: %s", path, exc_info=True)
+
+    def purge_disk(self) -> int:
+        """按访问时间淘汰超额缓存文件，返回删除数量。"""
+        d = self._disk_dir_ready()
+        if not d:
+            return 0
+        try:
+            files = [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".png")]
+        except OSError:
+            return 0
+        extra = len(files) - self.DISK_MAX_FILES
+        if extra <= 0:
+            return 0
+        try:
+            files.sort(key=lambda p: os.path.getatime(p))
+        except OSError:
+            pass
+        gone = 0
+        for p in files[:extra]:
+            try:
+                os.remove(p)
+                gone += 1
+            except OSError:
+                pass
+        if gone:
+            log.info("图标磁盘缓存清理 %d 个旧文件", gone)
+        return gone
 
     # ---------------------------------------------------------- 降级绘制
     def _fallback(self, size: int, letter: str) -> QPixmap:
@@ -1680,11 +1780,23 @@ class IconCache:
         key = ("%s|%s|%s|%s|%s" % (ring_key, kind, icon_path, target, label), size)
         if key in self._cache:
             return self._cache[key]
+        key_text = key[0]
 
         pm: Optional[QPixmap] = None
         src = ""
         cand = os.path.expandvars(os.path.expanduser(icon_path)) if icon_path else ""
         tgt = os.path.expandvars(os.path.expanduser(target)) if target else ""
+
+        # 0) 磁盘缓存：命中就直接读 PNG，完全跳过 Win32 COM 取图
+        disk_file = ""
+        probe = tgt or cand
+        if probe:
+            disk_file = self._disk_file(key_text, size, probe)
+            if disk_file:
+                pm = self._disk_load(disk_file)
+                if pm is not None:
+                    src = "磁盘缓存"
+                    self.disk_hits += 1
 
         # 1) 用户指定的自定义图标文件（图片直接读，exe/ico/lnk 走系统图标）
         if cand:
@@ -1732,6 +1844,9 @@ class IconCache:
 
         self._cache[key] = pm
         self._source[key] = src
+        # 新取到的图标顺手落盘，下次冷启动（含重启后）直接命中磁盘缓存
+        if disk_file and src != "磁盘缓存" and pm is not None and not pm.isNull():
+            self._disk_save(disk_file, pm)
         return pm
 
     def source_of(self, item: Dict[str, Any], size: int, ring_key: str = "") -> str:
@@ -4554,6 +4669,15 @@ class DialApp:
         self._start_hook()
         self._start_hotkey()
         self._prewarm_window()
+        self._prewarm_icons()
+
+        # 配置文件自动热重载：外部编辑器保存 1.5s 内生效，不必再去托盘点「重载配置」
+        self._cfg_sig = self._cfg_signature()
+        self._cfg_watch_count = 0
+        self._cfg_watch = QTimer(self.app)
+        self._cfg_watch.setInterval(1500)
+        self._cfg_watch.timeout.connect(self._watch_config)
+        self._cfg_watch.start()
 
     # -------------------------------------------------- 首帧预热
     def _prewarm_window(self) -> None:
@@ -4576,6 +4700,61 @@ class DialApp:
             log.info("圆盘首帧预热完成（屏幕外 show/hide）")
         except Exception as exc:  # 预热失败不影响主流程
             log.warning("圆盘首帧预热失败：%r", exc)
+
+    # -------------------------------------------------- 图标预热
+    def _prewarm_icons(self) -> None:
+        """节流预取全部槽位图标，让首次唤出零等待。
+
+        冷启动时每格图标都要走 Win32 COM（SHGetFileInfo + IImageList），
+        首次弹出逐格现取会看到图标「一格一格蹦出来」。这里在启动后
+        以每 25ms 一格的节奏把整盘图标预取一遍（同时落盘缓存），
+        既摊平了主线程压力，也让后续弹出全部命中缓存。
+        """
+        try:
+            cfg = self.config
+            n = int(cfg.get("sectors", 8))
+            dense = max(0.62, 8.0 / n) if n > 8 else 1.0
+            base_size = int(cfg.get("icon_size", 32) or 32)
+            jobs: List[Tuple[Dict[str, Any], int, str]] = []
+            for idx, ring in enumerate(cfg.get("rings") or []):
+                if not isinstance(ring, dict):
+                    continue
+                try:
+                    rsize = int(ring.get("icon_size") or 0) or base_size
+                except (TypeError, ValueError):
+                    rsize = base_size
+                size = int(max(14.0, rsize * dense))
+                rkey = str(ring.get("id") or ("ring%d" % (idx + 1)))
+                for item in ring.get("items") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    if not (item.get("target") or item.get("icon")):
+                        continue
+                    jobs.append((item, size, rkey))
+        except Exception as exc:
+            log.warning("图标预热跳过：%r", exc)
+            return
+        if not jobs:
+            return
+
+        queue = list(jobs)
+        total = len(queue)
+        state = {"done": 0}
+
+        def step() -> None:
+            if not queue:
+                log.info("图标预热完成：%d/%d 格（磁盘缓存命中 %d）",
+                         state["done"], total, self.icons.disk_hits)
+                return
+            item, size, rkey = queue.pop(0)
+            try:
+                self.icons.get(item, size, rkey)
+            except Exception:
+                log.debug("图标预热失败：%r", item, exc_info=True)
+            state["done"] += 1
+            QTimer.singleShot(25, step)
+
+        QTimer.singleShot(600, step)   # 等启动流程落地后再开始，避免抢主线程
 
     # -------------------------------------------------- 钩子
     def _phys_threshold(self) -> int:
@@ -4990,6 +5169,7 @@ class DialApp:
             ok, msg = save_config(self.config_file, self.config)
             if not ok:
                 log.warning("切环配置写入失败：%s", msg)
+        self._cfg_sig = self._cfg_signature()   # 切环时会写盘，同步指纹
         self._rebuild_ring_menu()
         self._update_tray_tooltip()
         log.info("窗口切环 -> %s（%d/%d）", idx + 1, idx + 1, len(rings))
@@ -5023,6 +5203,7 @@ class DialApp:
             self.hook.threshold = self._phys_threshold()
         log.info("设置已热应用：环=%s 扇区=%s 音效=%s",
                  self.window.ring_names(), cfg.get("sectors"), self.sound.theme)
+        self._cfg_sig = self._cfg_signature()   # 自己刚写完盘，别让轮询再重载一遍
         self.notify("设置已应用，圆盘立即生效")
 
     # -------------------------------------------------- 动作
@@ -5034,7 +5215,29 @@ class DialApp:
         pos = QCursor.pos()
         self.window.open_at(pos)
 
-    def reload_config(self) -> None:
+    # -------------------------------------------------- 配置自动热重载
+    def _cfg_signature(self) -> str:
+        """配置文件指纹（修改时间 + 大小），用于判断是否被外部修改过。"""
+        try:
+            st = os.stat(self.config_file)
+            mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1_000_000_000)))
+            return "%d:%d" % (mtime_ns, st.st_size)
+        except OSError:
+            return ""
+
+    def _watch_config(self) -> None:
+        """轮询配置文件指纹，变了就静默热重载（编辑器里改完即生效）。"""
+        sig = self._cfg_signature()
+        if not sig or sig == getattr(self, "_cfg_sig", ""):
+            return
+        self._cfg_sig = sig
+        log.info("检测到配置文件被外部修改，自动热重载")
+        try:
+            self.reload_config(silent=True)
+        except Exception as exc:
+            log.warning("自动热重载失败：%r", exc)
+
+    def reload_config(self, silent: bool = False) -> None:
         cfg, status = load_config(self.config_file)
         self.config = cfg
         self.window.set_config(cfg)
@@ -5052,8 +5255,10 @@ class DialApp:
             self._start_hotkey()
         log.info("重载配置: %s（音效 theme=%s mute=%s，热键 %s）", status,
                  self.sound.theme, self.sound.mute, new_seq)
+        self._cfg_sig = self._cfg_signature()   # 记住当前指纹，避免自写触发二次重载
         self._update_tray_tooltip()
-        self.notify(f"配置已重载（{status}）")
+        if not silent:
+            self.notify(f"配置已重载（{status}）")
 
     def toggle_mute(self, checked: bool) -> None:
         self.sound.mute = bool(checked)
@@ -5215,6 +5420,33 @@ def _ensure_streams() -> None:
         sys.stderr = fh
 
 
+def _icon_cache_stat(cache: "IconCache") -> Dict[str, Any]:
+    """统计图标磁盘缓存现状（供 --selftest 输出，方便排障）。"""
+    out: Dict[str, Any] = {"dir": "", "files": 0, "kb": 0.0, "disk_hits": 0}
+    try:
+        d = icon_cache_dir()
+        out["dir"] = d
+        n = 0
+        total = 0
+        for f in os.listdir(d):
+            if not f.endswith(".png"):
+                continue
+            n += 1
+            try:
+                total += os.path.getsize(os.path.join(d, f))
+            except OSError:
+                pass
+        out["files"] = n
+        out["kb"] = round(total / 1024.0, 1)
+    except Exception:
+        pass
+    try:
+        out["disk_hits"] = int(getattr(cache, "disk_hits", 0))
+    except Exception:
+        pass
+    return out
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     _ensure_streams()
     _setup_logging()
@@ -5279,6 +5511,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "colors": dial.window.cfg.get("colors"),
                 "animations": bool(dial.window.animations_enabled()),
                 "tray_mute": bool(getattr(dial, "act_mute", None) and dial.act_mute.isChecked()),
+                # 图标磁盘缓存自检
+                "icon_cache": _icon_cache_stat(dial.icons),
             })
             print("SELFTEST " + json.dumps(result, ensure_ascii=False))
             dial.quit()
